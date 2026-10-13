@@ -39,7 +39,7 @@ SnapAsk turns that into **one shortcut**. It works in any app (Preview, PowerPoi
 
 ```bash
 # 1. Download the code
-git clone https://github.com/<your-username>/SnapAsk-AI.git
+git clone https://github.com/houtsing/SnapAsk-AI.git
 cd SnapAsk-AI
 
 # 2. (Recommended) create a local signing certificate so macOS remembers
