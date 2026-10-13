@@ -39,6 +39,7 @@ public static class Sites
 
     public static readonly string AskJs = Load("ask.js");
     public static readonly string ReadJs = Load("read.js");
+    public static readonly string SignedInJs = Load("signedin.js");
 
     private static string Load(string name)
     {

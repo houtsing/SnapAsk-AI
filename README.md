@@ -14,7 +14,7 @@ Asking an AI about something on screen normally takes several steps: take a scre
 
 SnapAsk turns that into **one shortcut**. It works in any app (Preview, PowerPoint, Zoom, a terminal, anything), with the AI you trust most for the job.
 
-**Free accounts are enough:** Claude Free, ChatGPT Free and Gemini (personal Google account) all work. No API keys and no paid plan needed.
+**Free accounts are enough:** Claude Free, ChatGPT Free and Gemini (personal Google account) all work. No API keys and no paid plan needed. If you already use the **Claude Code CLI**, SnapAsk detects it and uses it for Claude automatically.
 
 ## Features
 
@@ -23,10 +23,11 @@ SnapAsk turns that into **one shortcut**. It works in any app (Preview, PowerPoi
 - **Floating popup** next to where you made the snapshot. It stays on top until you close it (**Esc**).
 - **Three AIs, one box:** **Claude**, **ChatGPT** and **Gemini**. Switch with ⌘1/⌘2/⌘3 (Mac) or Ctrl+1/2/3 (Windows).
 - **Your own accounts, no API keys:** each AI runs through its real website (claude.ai, chatgpt.com, gemini.google.com), loaded in a hidden page in the background and signed in to your account. This works on free plans, and with school or work accounts that block third-party tools.
-  - *Mac, optional:* if you have Claude Pro or Max and the Claude Code CLI, you can route Claude through the CLI instead for slightly faster replies (see [Options](#options)).
+  - **Claude Code CLI users:** if `claude` is installed and signed in, SnapAsk uses it for Claude automatically. It's slightly faster, and you don't need to sign in again. You can also force either route.
 - **Streaming answers** with bold, bullet lists and code.
 - **Follow-up questions** keep the conversation going. If you switch AIs midway, the new one gets the snapshot and the conversation so far.
 - **Open full chat ↗** shows the real website for that conversation.
+- **Setup window** with sign-in status for each AI and one-click **Sign in** buttons.
 - Lives in the **menu bar** (Mac) or **system tray** (Windows). Optional start at login.
 
 ## Download
@@ -39,6 +40,39 @@ Prebuilt downloads are on the **[Releases page](https://github.com/houtsing/Snap
 | **macOS 14+** (Apple Silicon) | `SnapAsk-macOS-arm64.zip` | Unzip, move `SnapAsk.app` to Applications, then **right-click → Open** the first time (it isn't notarised by Apple). |
 
 Or build from source, below.
+
+---
+
+## Signing in to Claude, ChatGPT and Gemini
+
+SnapAsk never sees or stores your password. It shows each AI's **own login page** in a small built-in browser window, and you sign in there exactly as you would in a normal browser (email, Google, Apple, Microsoft, or school/work single sign-on). The site's cookies are then kept in SnapAsk's private browser storage on your computer, so you stay signed in, just like a browser.
+
+1. On first launch, the **SnapAsk setup** window opens, with an **Accounts** list:
+
+   | | |
+   |---|---|
+   | ✔ Claude | Signed in / *via Claude Code CLI* |
+   | ! ChatGPT | Not signed in → **Sign in…** |
+   | ✔ Gemini | Signed in |
+
+2. Click **Sign in…** next to each AI you want to use. The site's login page opens. Sign in, then close that window. The status turns ✔ within a few seconds.
+3. You only need the AIs you plan to use. Free accounts are fine.
+
+You can reopen this window any time: **menu bar icon → Setup & Accounts…** (Mac) or **tray icon → Setup & accounts…** (Windows). If you ask an AI you haven't signed in to, the popup shows a **Sign in to …** button right there.
+
+### Claude: claude.ai or the Claude Code CLI
+
+The setup window has a **Claude via** option:
+
+| Option | What it does |
+|---|---|
+| **Auto** (default) | Uses the Claude Code CLI if it's installed and signed in (`claude auth status`), otherwise claude.ai |
+| **claude.ai** | Always uses the website (works with any plan, including Free) |
+| **Claude Code CLI** | Always uses the `claude` command (Pro/Max or API account; slightly faster, streams token by token) |
+
+If the CLI isn't signed in yet, the **Sign in…** button runs `claude auth login` for you.
+
+To sign out, open the AI with **Open** in the setup window and sign out on the site as usual. To remove everything, uninstall (see below).
 
 ---
 
@@ -78,7 +112,7 @@ After turning on Screen Recording, **quit and reopen SnapAsk** (menu bar icon �
 
 ### Sign in
 
-Menu bar icon → **Sign in** → **Claude** / **ChatGPT** / **Gemini**. A small browser window opens. Sign in as you normally would, then close the window. You only need to sign in to the AIs you plan to use.
+The setup window opens on first launch. See [Signing in](#signing-in-to-claude-chatgpt-and-gemini).
 
 ### Using it
 
@@ -90,10 +124,8 @@ Menu bar icon: Snap & Ask, shortcut and permissions, default AI, sign in, Launch
 ### Options
 
 ```bash
-# Use the Claude Code CLI for Claude instead of claude.ai (needs Claude Pro/Max + `claude` signed in)
-defaults write com.snapask.app claude.backend cli
-defaults write com.snapask.app model.claude opus      # optional model for the CLI route
-defaults delete com.snapask.app claude.backend        # back to claude.ai
+defaults write com.snapask.app claude.backend web    # same as "Claude via" in the setup window: auto | web | cli
+defaults write com.snapask.app model.claude opus     # model for the CLI route (optional)
 ```
 
 ### Where SnapAsk stores things
@@ -135,7 +167,7 @@ dotnet publish -c Release -r win-x64 --self-contained true -p:PublishSingleFile=
 
 SnapAsk appears as a **viewfinder icon in the system tray** (bottom-right; it may be under the **^** arrow). No special permissions are needed.
 
-1. Right-click the tray icon → **Sign in / open full chat** → **Claude** / **ChatGPT** / **Gemini**. Sign in, then close that window.
+1. The **SnapAsk setup** window opens. Click **Sign in…** next to each AI you want ([details](#signing-in-to-claude-chatgpt-and-gemini)).
 2. Press **Ctrl + Alt + S**, drag over an area, and type your question in the popup.
 
 | Key | Action |
@@ -144,13 +176,13 @@ SnapAsk appears as a **viewfinder icon in the system tray** (bottom-right; it ma
 | **Ctrl + 1 / 2 / 3** | Switch to Claude / ChatGPT / Gemini |
 | **Esc** | Close the popup (or cancel a selection) |
 
-Tray menu: Snap & Ask, default AI, **Shortcut** (Ctrl+Alt+S, Ctrl+Shift+Space, Alt+Shift+A, Ctrl+Shift+2, Ctrl+Alt+Shift+S), sign in, **Start with Windows**, Quit. Double-click the tray icon to snap.
+Tray menu: Snap & Ask, Setup & accounts, default AI, **Shortcut** (Ctrl+Alt+S, Ctrl+Shift+Space, Alt+Shift+A, Ctrl+Shift+2, Ctrl+Alt+Shift+S), sign in, **Start with Windows**, Quit. Double-click the tray icon to snap.
 
 ### Where SnapAsk stores things
 
 | What | Path |
 |---|---|
-| Settings | `%APPDATA%\SnapAsk\settings.json` |
+| Settings (default AI, shortcut, Claude route) | `%APPDATA%\SnapAsk\settings.json` |
 | Website sign-ins, log | `%LOCALAPPDATA%\SnapAsk\` |
 
 **Uninstall:** if you turned on *Start with Windows*, turn it off from the tray menu first. Then quit SnapAsk and delete `SnapAsk.exe` and the two folders above.
@@ -190,6 +222,8 @@ macos/
   scripts/uninstall.sh            remove the app and all its data
 windows/SnapAsk/
   Program.cs        tray icon, menu, startup
+  Accounts.cs       setup window: sign-in status, Sign in buttons, Claude route
+  ClaudeCli.cs      Claude Code CLI route (detection + streaming session)
   HotKeys.cs        global shortcut
   Capture.cs        drag-to-select screen overlay
   Popup.cs          the floating ask window
@@ -208,7 +242,7 @@ docs/screenshot.png
 | Mac: shortcut does nothing | Reopen the app to see the setup window. Both permissions must be green. Try another shortcut there. |
 | Mac: permissions say "not granted" even though they're on | The entry belongs to an older build. Remove SnapAsk from the list with **–** and add it again (or run `tccutil reset ScreenCapture com.snapask.app` and `tccutil reset Accessibility com.snapask.app`). `create-signing-cert.sh` prevents this. |
 | Windows: shortcut does nothing | Another app owns it. Pick a different one in tray menu → Shortcut. |
-| "… isn't signed in" | Mac: menu bar → Sign in. Windows: tray icon → Sign in / open full chat. |
+| "… isn't signed in" | Click the **Sign in to …** button in the popup, or use the setup window. |
 | Google sign-in says "this browser may not be secure" | Use the site's email sign-in option instead, or sign in with Apple or Microsoft. |
 | An AI stops answering or times out | The site probably changed its page layout, so the selectors need updating (see How it works). Open an issue, or use **Open full chat ↗** in the meantime. Logs: `~/Library/Logs/SnapAsk.log` (Mac), `%LOCALAPPDATA%\SnapAsk\SnapAsk.log` (Windows). |
 

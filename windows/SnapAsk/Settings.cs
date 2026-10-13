@@ -8,6 +8,8 @@ public sealed class Settings
 {
     public Provider Provider { get; set; } = Provider.Claude;
     public string HotKey { get; set; } = HotKeys.All[0].Label;
+    public ClaudeRoute ClaudeRoute { get; set; } = ClaudeRoute.Auto;
+    public bool Welcomed { get; set; }
 
     private static readonly string Dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SnapAsk");
     private static readonly string FilePath = Path.Combine(Dir, "settings.json");

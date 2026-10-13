@@ -24,6 +24,7 @@ public sealed class Popup : Window
         public string Text = "";
         public bool IsError;
         public TextBlock? View;
+        public StackPanel? Box;
         public bool IsUser => Role == "You";
     }
 
@@ -42,6 +43,8 @@ public sealed class Popup : Window
     private readonly Dictionary<Provider, Button> tabs = new();
     private Provider provider;
     private bool busy;
+    private ClaudeCli.Session? claudeCli;
+    private int claudeCliSynced;
 
     private readonly StackPanel list = new() { Margin = new Thickness(12) };
     private readonly ScrollViewer scroller;
@@ -93,7 +96,7 @@ public sealed class Popup : Window
         var close = new Button { Content = "✕", Foreground = Dim, Background = Brushes.Transparent, BorderThickness = new Thickness(0), Margin = new Thickness(8, 0, 0, 0), Cursor = Cursors.Hand, Template = FlatButton(), ToolTip = "Close (Esc)" };
         close.Click += (_, _) => Close();
         var full = new Button { Content = "Open full chat ↗", Foreground = Accent, Background = Brushes.Transparent, BorderThickness = new Thickness(0), FontSize = 11, Cursor = Cursors.Hand, Template = FlatButton() };
-        full.Click += (_, _) => WebBackend.Get(provider).ShowFull();
+        full.Click += (_, _) => Accounts.SignIn(provider);
         var hint = new TextBlock { Text = "Ctrl+1 / 2 / 3 to switch", Foreground = Dim, FontSize = 11, Margin = new Thickness(10, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
 
         var right = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right };
@@ -161,7 +164,11 @@ public sealed class Popup : Window
         };
         SourceInitialized += (_, _) => PlaceNearAnchor();
         Loaded += (_, _) => { Activate(); input.Focus(); };
-        Closed += (_, _) => { foreach (Provider p in Enum.GetValues(typeof(Provider))) WebBackend.Get(p).Release(id); };
+        Closed += (_, _) =>
+        {
+            claudeCli?.Dispose();
+            WebBackend.ReleaseAll(id);
+        };
         SetProvider(provider);
     }
 
@@ -187,6 +194,7 @@ public sealed class Popup : Window
         SetBusy(true);
 
         var p = provider;
+        if (p == Provider.Claude && ClaudeCli.InUse) { AskClaudeCli(q, prior, reply); return; }
         var backend = WebBackend.Get(p);
         bool isFirst = backend.Owner != id;   // new chat on that site: send the image + earlier context
         if (isFirst) synced[p] = 0;
@@ -198,18 +206,42 @@ public sealed class Popup : Window
             .ContinueWith(task => Dispatcher.Invoke(() =>
             {
                 string? err = task.IsFaulted ? task.Exception?.GetBaseException().Message : task.Result;
-                if (err != null)
-                {
-                    reply.IsError = true;
-                    Update(reply, (reply.Text.Length > 0 ? reply.Text + "\n\n" : "") + "⚠ " + err);
-                }
-                else
-                {
-                    synced[p] = messages.Count;
-                    if (reply.Text.Length == 0) Update(reply, "(empty response)");
-                }
-                SetBusy(false);
+                if (err == null) synced[p] = messages.Count;
+                Finish(reply, err, p);
             }));
+    }
+
+    private void Finish(Msg reply, string? err, Provider p)
+    {
+        if (err != null)
+        {
+            reply.IsError = true;
+            Update(reply, (reply.Text.Length > 0 ? reply.Text + "\n\n" : "") + "⚠ " + err);
+            if (err.Contains("isn't signed in"))
+            {
+                var b = new Button { Content = $"Sign in to {p}…", Margin = new Thickness(0, 8, 0, 0), HorizontalAlignment = HorizontalAlignment.Left, Padding = new Thickness(10, 3, 10, 3) };
+                b.Click += (_, _) => Accounts.SignIn(p);
+                reply.Box?.Children.Add(b);
+            }
+        }
+        else if (reply.Text.Length == 0) Update(reply, "(empty response)");
+        SetBusy(false);
+    }
+
+    private void AskClaudeCli(string q, List<Msg> prior, Msg reply)
+    {
+        try
+        {
+            bool isNew = claudeCli == null || !claudeCli.Alive;
+            if (isNew) { claudeCli?.Dispose(); claudeCli = new ClaudeCli.Session(); claudeCliSynced = 0; }
+            var missed = prior.Skip(Math.Min(claudeCliSynced, prior.Count)).ToList();
+            claudeCliSynced = messages.Count;
+            _ = claudeCli!.AskAsync(Transcript(missed, q), isNew ? png : null,
+                    d => Dispatcher.Invoke(() => Update(reply, reply.Text + d)))
+                .ContinueWith(t => Dispatcher.Invoke(() =>
+                    Finish(reply, t.IsFaulted ? t.Exception?.GetBaseException().Message : t.Result, Provider.Claude)));
+        }
+        catch (Exception ex) { Finish(reply, ex.Message, Provider.Claude); }
     }
 
     private static string Transcript(List<Msg> history, string question)
@@ -228,6 +260,7 @@ public sealed class Popup : Window
         var role = new TextBlock { Text = m.Role, Foreground = Dim, FontSize = 11, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 4) };
         m.View = new TextBlock { TextWrapping = TextWrapping.Wrap, Foreground = Fg };
         var stack = new StackPanel { Children = { role, m.View } };
+        m.Box = stack;
         list.Children.Add(m.IsUser
             ? new Border { Child = stack, Margin = new Thickness(0, 0, 0, 12) }
             : new Border { Child = stack, Background = Card, CornerRadius = new CornerRadius(8), Padding = new Thickness(10), Margin = new Thickness(0, 0, 0, 12) });

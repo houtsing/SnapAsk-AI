@@ -27,7 +27,11 @@ public sealed class WebBackend
     }
 
     /// Start every site loading at launch, so the first question doesn't wait for a page load.
-    public static void PrewarmAll() { foreach (Provider p in Enum.GetValues(typeof(Provider))) Get(p); }
+    public static void PrewarmAll()
+    {
+        foreach (Provider p in Enum.GetValues(typeof(Provider)))
+            if (p != Provider.Claude || !ClaudeCli.InUse) Get(p);
+    }
 
     private static Task<CoreWebView2Environment> Env() => env ??= CoreWebView2Environment.CreateAsync(
         null, Path.Combine(Log.Dir, "WebView2"),
@@ -105,6 +109,20 @@ public sealed class WebBackend
 
     public void Release(Guid id) { if (Owner == id) _ = ResetAsync(); }
 
+    public static void ReleaseAll(Guid id) { foreach (var b in all.Values) b.Release(id); }
+
+    /// true = signed in, false = not signed in, null = still loading / unknown.
+    public async Task<bool?> CheckSignedInAsync()
+    {
+        if (!ready.IsCompleted) return null;
+        try
+        {
+            var r = await RunAsync(Sites.SignedInJs, new Dictionary<string, object> { ["composer"] = site.Composer }, TimeSpan.FromSeconds(5));
+            return r.ValueKind switch { JsonValueKind.True => true, JsonValueKind.False => false, _ => null };
+        }
+        catch { return null; }
+    }
+
     public static void ReloadAll() { foreach (var b in all.Values) _ = b.ResetAsync(); }
 
     // ---- Showing the real page (sign-in, full chat) ----
@@ -165,7 +183,7 @@ public sealed class WebBackend
             string code = r.TryGetProperty("error", out var e) ? e.GetString() ?? "unknown" : "unknown";
             Log.Write($"{Provider} ask failed: {code}");
             return code == "not-signed-in"
-                ? $"{Provider} isn't signed in. Right-click the SnapAsk tray icon → Sign in → {Provider}."
+                ? $"{Provider} isn't signed in yet. Sign in once, then ask again."
                 : $"Couldn't send to {Provider} ({code}). Try “Open full chat”.";
         }
 

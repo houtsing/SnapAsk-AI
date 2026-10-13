@@ -22,7 +22,7 @@ public static class Program
         if (!first) { MessageBox.Show("SnapAsk is already running — look for its icon in the system tray.", "SnapAsk"); return; }
 
         var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
-        app.Startup += (_, _) =>
+        app.Startup += async (_, _) =>
         {
             Log.Write("launched");
             SetupTray();
@@ -30,7 +30,9 @@ public static class Program
                 tray!.ShowBalloonTip(5000, "SnapAsk", $"{HotKeys.Current.Label} is used by another app. Pick another shortcut from the tray menu.", WinForms.ToolTipIcon.Warning);
             else
                 tray!.ShowBalloonTip(4000, "SnapAsk is running", $"Press {HotKeys.Current.Label} to snapshot and ask.", WinForms.ToolTipIcon.Info);
+            await ClaudeCli.DetectAsync();
             WebBackend.PrewarmAll();
+            if (!Settings.Current.Welcomed) Accounts.ShowWindow();
         };
         app.Exit += (_, _) => { if (tray != null) tray.Visible = false; };
         app.Run();
@@ -67,6 +69,7 @@ public static class Program
     {
         var m = new WinForms.ContextMenuStrip();
         m.Items.Add($"Snap && Ask    {HotKeys.Current.Label}", null, (_, _) => Snap());
+        m.Items.Add("Setup && accounts…", null, (_, _) => Accounts.ShowWindow());
         m.Items.Add(new WinForms.ToolStripSeparator());
 
         var model = new WinForms.ToolStripMenuItem("Default model");
@@ -94,7 +97,7 @@ public static class Program
 
         var signIn = new WinForms.ToolStripMenuItem("Sign in / open full chat");
         foreach (Provider p in Enum.GetValues(typeof(Provider)))
-            signIn.DropDownItems.Add(p.ToString(), null, (_, _) => WebBackend.Get(p).ShowFull());
+            signIn.DropDownItems.Add(p.ToString(), null, (_, _) => Accounts.SignIn(p));
         m.Items.Add(signIn);
 
         var startup = new WinForms.ToolStripMenuItem("Start with Windows") { Checked = StartsWithWindows };

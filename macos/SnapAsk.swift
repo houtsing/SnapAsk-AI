@@ -9,6 +9,62 @@ import ServiceManagement
 import CoreGraphics
 import ApplicationServices
 
+// MARK: - Claude route: claude.ai (any plan, incl. Free) or the Claude Code CLI (Pro/Max, faster)
+
+enum ClaudeRoute: String, CaseIterable, Identifiable {
+    case auto, web, cli
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .auto: return "Auto"
+        case .web: return "claude.ai"
+        case .cli: return "Claude Code CLI"
+        }
+    }
+
+    static var setting: ClaudeRoute {
+        get { ClaudeRoute(rawValue: UserDefaults.standard.string(forKey: "claude.backend") ?? "") ?? .auto }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "claude.backend") }
+    }
+
+    /// Result of `claude auth status` at launch: CLI installed and signed in.
+    static var cliSignedIn = false
+    static var cliEmail: String?
+
+    static var usesCLI: Bool {
+        switch setting {
+        case .cli: return true
+        case .web: return false
+        case .auto: return cliSignedIn
+        }
+    }
+
+    /// Runs `claude auth status` in the background, then calls `done` on the main thread.
+    static func detect(_ done: @escaping () -> Void) {
+        guard let exe = resolveExecutable("claude") else { dlog("claude CLI not found"); cliSignedIn = false; return done() }
+        dlog("checking claude CLI at \(exe)")
+        DispatchQueue.global().async {
+            let p = Process(), out = Pipe()
+            p.executableURL = URL(fileURLWithPath: exe)
+            p.arguments = ["auth", "status"]
+            p.environment = cliEnvironment
+            p.standardOutput = out
+            p.standardError = FileHandle.nullDevice
+            try? p.run()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            if json == nil { dlog("claude auth status output: \(String(data: data.prefix(300), encoding: .utf8) ?? "?") exit=\(p.terminationStatus)") }
+            DispatchQueue.main.async {
+                cliSignedIn = json?["loggedIn"] as? Bool == true
+                cliEmail = json?["email"] as? String
+                dlog("claude CLI signed in=\(cliSignedIn)")
+                done()
+            }
+        }
+    }
+}
+
 // MARK: - Debug log (~/Library/Logs/SnapAsk.log)
 
 func dlog(_ msg: String) {
@@ -33,9 +89,7 @@ enum Provider: String, CaseIterable, Identifiable {
     var site: WebSite? {
         switch self {
         case .claude:
-            // Default: claude.ai (works on the Free plan). Paid subscribers can opt into the faster CLI:
-            //   defaults write com.snapask.app claude.backend cli
-            if UserDefaults.standard.string(forKey: "claude.backend") == "cli" { return nil }
+            if ClaudeRoute.usesCLI { return nil }   // Claude Code CLI instead of claude.ai
             return WebSite(
                 url: "https://claude.ai/new",
                 composer: "div.ProseMirror[contenteditable=\"true\"], [data-testid=\"chat-input\"] [contenteditable=\"true\"]",
@@ -327,6 +381,22 @@ final class WebBackend {
         fresh = true
     }
 
+    /// true = signed in, false = not signed in, nil = page still loading / unknown.
+    func checkSignedIn(_ done: @escaping (Bool?) -> Void) {
+        chat.webView.callAsyncJavaScript(Self.signedInJS, arguments: ["composer": chat.site.composer], in: nil, in: .page) { r in
+            done((try? r.get()) as? Bool)
+        }
+    }
+
+    private static let signedInJS = """
+    const vis = e => e && e.getClientRects().length > 0;
+    if (/\\/(login|logout|auth|signin|sign-in)/i.test(location.pathname) || /^(accounts|auth|login)\\./.test(location.hostname)) return false;
+    const loginButton = [...document.querySelectorAll('a, button')].some(e => vis(e) &&
+      /^(log ?in|sign ?in|sign up|get started)$/i.test((e.innerText || e.getAttribute('aria-label') || '').trim()));
+    if (loginButton) return false;
+    return document.querySelector(composer) ? true : null;
+    """
+
     /// Back to a blank new chat, ready for the next snapshot.
     func reset() {
         generation += 1
@@ -380,7 +450,7 @@ final class WebBackend {
                     }
                     dlog("\(self.provider.rawValue) ask failed: \(code)")
                     return onDone(code == "not-signed-in"
-                        ? "\(self.provider.rawValue) isn't signed in. Use the menu bar icon → Sign in → \(self.provider.rawValue)."
+                        ? "\(self.provider.rawValue) isn't signed in yet. Sign in once, then ask again."
                         : "Couldn't send to \(self.provider.rawValue) (\(code)). Try “Open full chat”.")
                 }
                 self.poll(gen: gen, before: before, last: "", stable: 0, started: Date(), onUpdate: onUpdate, onDone: onDone)
@@ -567,6 +637,7 @@ struct Msg: Identifiable {
     var role: String          // "You" or provider name
     var text: String
     var isError = false
+    var signIn: Provider?      // show a "Sign in to …" button under this (error) message
     var isUser: Bool { role == "You" }
 }
 
@@ -620,6 +691,7 @@ final class ChatModel: ObservableObject {
                 let e = err.trimmingCharacters(in: .whitespacesAndNewlines)
                 self.messages[i].text += (self.messages[i].text.isEmpty ? "" : "\n\n") + "⚠️ " + e
                 self.messages[i].isError = true
+                if e.contains("isn't signed in"), let p = Provider(rawValue: self.messages[i].role) { self.messages[i].signIn = p }
             }
             self.messages[i].text = self.messages[i].text.trimmingCharacters(in: .whitespacesAndNewlines)
             if self.messages[i].text.isEmpty { self.messages[i].text = "(empty response)" }
@@ -712,6 +784,10 @@ struct MessageRow: View {
                     .foregroundStyle(msg.isError ? Color.red : Color.primary)
                     .textSelection(.enabled)
                     .fixedSize(horizontal: false, vertical: true)
+                if let p = msg.signIn {
+                    Button("Sign in to \(p.rawValue)…") { AppDelegate.shared.signIn(to: p) }
+                        .padding(.top, 4)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -944,14 +1020,40 @@ struct WelcomeView: View {
     @State private var hotkey = HotKeyChoice.current.label
     @State private var screenOK = CGPreflightScreenCaptureAccess()
     @State private var axOK = AXIsProcessTrusted()
+    @State private var claudeRoute = ClaudeRoute.setting
+    @State private var signedIn: [Provider: Bool?] = [:]
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+
+    private func refreshAccounts() {
+        for p in Provider.allCases {
+            if p == .claude && ClaudeRoute.usesCLI { signedIn[p] = ClaudeRoute.cliSignedIn; continue }
+            WebBackend.get(p)?.checkSignedIn { signedIn[p] = $0 }
+        }
+    }
+
+    @ViewBuilder private func accountRow(_ p: Provider) -> some View {
+        let state = signedIn[p] ?? nil
+        let viaCLI = p == .claude && ClaudeRoute.usesCLI
+        HStack {
+            Image(systemName: state == true ? "checkmark.circle.fill" : state == false ? "person.crop.circle.badge.exclamationmark" : "circle.dotted")
+                .foregroundStyle(state == true ? .green : state == false ? .orange : .secondary)
+            Text(p.rawValue).frame(width: 64, alignment: .leading)
+            Text(viaCLI ? (state == true ? "via Claude Code CLI" : "CLI not signed in — run `claude` in Terminal")
+                        : state == true ? "Signed in" : state == false ? "Not signed in" : "Checking…")
+                .font(.callout).foregroundStyle(.secondary)
+            Spacer()
+            if !viaCLI {
+                Button(state == true ? "Open" : "Sign in…") { AppDelegate.shared.signIn(to: p) }
+            }
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 10) {
                 Image(systemName: "text.viewfinder").font(.system(size: 28))
                 VStack(alignment: .leading) {
-                    Text("SnapAsk is running").font(.headline)
+                    Text("SnapAsk setup").font(.headline)
                     Text("It lives in your menu bar (viewfinder icon).").font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -992,6 +1094,27 @@ struct WelcomeView: View {
                 Text("After enabling SnapAsk in System Settings → Privacy & Security → Screen & System Audio Recording, quit and reopen SnapAsk.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
+            Divider()
+            Text("Accounts").font(.headline)
+            Text("Sign in once to each AI you want to use (free accounts work). You stay signed in.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            ForEach(Provider.allCases) { accountRow($0) }
+            HStack {
+                Text("Claude via:")
+                Picker("", selection: $claudeRoute) {
+                    ForEach(ClaudeRoute.allCases) { Text($0.label).tag($0) }
+                }
+                .labelsHidden().frame(width: 160)
+                .onChange(of: claudeRoute) {
+                    ClaudeRoute.setting = claudeRoute
+                    WebBackend.prewarmAll()
+                    refreshAccounts()
+                }
+            }
+            Text(claudeRoute == .auto
+                 ? (ClaudeRoute.cliSignedIn ? "Auto: using your Claude Code CLI (\(ClaudeRoute.cliEmail ?? "signed in"))." : "Auto: no signed-in Claude Code CLI found, so using claude.ai.")
+                 : claudeRoute == .cli ? "Uses the `claude` command (needs Claude Pro/Max). Slightly faster." : "Uses claude.ai — works with any plan, including Free.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Spacer()
                 Button("Snap now") { AppDelegate.shared.closeWelcome(); AppDelegate.shared.snap() }
@@ -999,8 +1122,12 @@ struct WelcomeView: View {
             }
         }
         .padding(18)
-        .frame(width: 380)
-        .onReceive(timer) { _ in screenOK = CGPreflightScreenCaptureAccess(); axOK = AXIsProcessTrusted() }
+        .frame(width: 420)
+        .onAppear(perform: refreshAccounts)
+        .onReceive(timer) { t in
+            screenOK = CGPreflightScreenCaptureAccess(); axOK = AXIsProcessTrusted()
+            if Int(t.timeIntervalSince1970) % 3 == 0 { refreshAccounts() }
+        }
     }
 }
 
@@ -1020,7 +1147,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dlog("launched")
         setupStatusItem()
         registerHotKey()
-        WebBackend.prewarmAll()
+        ClaudeRoute.detect { WebBackend.prewarmAll() }
         // Test hook: `osascript -e 'tell application "SnapAsk" to activate'` won't work for accessory apps, so listen here.
         DistributedNotificationCenter.default().addObserver(forName: .init("com.snapask.snap"), object: nil, queue: .main) { _ in self.snap() }
         installDebugHooks()
@@ -1038,7 +1165,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private var welcome: NSWindow?
+    var welcome: NSWindow?
 
     func showWelcome() {
         if welcome == nil {
@@ -1072,7 +1199,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let snap = NSMenuItem(title: "Snap & Ask   \(HotKeyChoice.current.label)", action: #selector(snapFromMenu), keyEquivalent: "")
         snap.target = self
         menu.addItem(snap)
-        let settings = NSMenuItem(title: "Shortcut & Permissions…", action: #selector(showWelcomeFromMenu), keyEquivalent: "")
+        let settings = NSMenuItem(title: "Setup & Accounts…", action: #selector(showWelcomeFromMenu), keyEquivalent: "")
         settings.target = self
         menu.addItem(settings)
         menu.addItem(.separator())
@@ -1129,6 +1256,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var webSignIns: [Provider: (window: NSWindow, web: WebChat)] = [:]
+
+    func signIn(to p: Provider) {
+        if p.site != nil { showWebSignIn(p) }
+        else { // CLI route
+            let script = "tell application \"Terminal\" to activate\ntell application \"Terminal\" to do script \"export PATH='\(cliEnvironment["PATH"] ?? "")'; claude auth login\""
+            var err: NSDictionary?
+            NSAppleScript(source: script)?.executeAndReturnError(&err)
+        }
+    }
 
     private func showWebSignIn(_ p: Provider) {
         guard let site = p.site else { return }
@@ -1231,10 +1367,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             web.webView.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { r in dlog("eval => \(r)") }
         }
         dnc.addObserver(forName: .init("com.snapask.debug.shot"), object: nil, queue: .main) { n in
-            guard let out = n.object as? String, let panel = self.panels.last else { return }
+            guard let out = n.object as? String, let win = self.panels.last ?? self.welcome else { return }
             let p = Process()
             p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-            p.arguments = ["-x", "-o", "-l", "\(panel.windowNumber)", out]
+            p.arguments = ["-x", "-o", "-l", "\(win.windowNumber)", out]
             try? p.run(); p.waitUntilExit()
             dlog("shot => \(out)")
         }
@@ -1249,8 +1385,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let panel = self.panels.last else { return }
             for m in panel.model.messages { dlog("[\(m.role)] \(m.text)") }
         }
+        dnc.addObserver(forName: .init("com.snapask.debug.welcome"), object: nil, queue: .main) { _ in self.showWelcome() }
         dnc.addObserver(forName: .init("com.snapask.debug.closeall"), object: nil, queue: .main) { _ in
             self.panels.forEach { $0.close() }
+            self.welcome?.close()
         }
     }
 
