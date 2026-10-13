@@ -1,6 +1,9 @@
 #!/bin/zsh
 # Builds SnapAsk.app and installs it to ~/Applications.
+#   ./build.sh               build + install + (re)launch-ready
+#   ./build.sh --no-install  only build into ./build (used by CI)
 set -euo pipefail
+NO_INSTALL=${1:-}
 cd "$(dirname "$0")"
 
 APP="build/SnapAsk.app"
@@ -29,6 +32,8 @@ PLIST
 # Stable local identity so macOS permissions survive rebuilds (falls back to ad-hoc).
 ID=$(security find-identity -p codesigning | awk '/SnapAsk Local Signing/ {print $2; exit}')
 codesign --force --sign "${ID:--}" "$APP"
+
+[[ "$NO_INSTALL" == "--no-install" ]] && { echo "Built $APP"; exit 0; }
 
 mkdir -p ~/Applications
 pkill -x SnapAsk 2>/dev/null || true

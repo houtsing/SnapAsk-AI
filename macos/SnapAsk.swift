@@ -32,7 +32,16 @@ enum Provider: String, CaseIterable, Identifiable {
     /// Providers driven through their website (signed in with your own account).
     var site: WebSite? {
         switch self {
-        case .claude: return nil
+        case .claude:
+            // Default: claude.ai (works on the Free plan). Paid subscribers can opt into the faster CLI:
+            //   defaults write com.snapask.app claude.backend cli
+            if UserDefaults.standard.string(forKey: "claude.backend") == "cli" { return nil }
+            return WebSite(
+                url: "https://claude.ai/new",
+                composer: "div.ProseMirror[contenteditable=\"true\"], [data-testid=\"chat-input\"] [contenteditable=\"true\"]",
+                send: "button[aria-label=\"Send message\"], button[aria-label=\"Send Message\"]",
+                reply: ".font-claude-response, [data-testid=\"assistant-message\"]",
+                stop: "button[aria-label=\"Stop response\"], [data-is-streaming=\"true\"]")
         case .chatgpt: return WebSite(
             url: "https://chatgpt.com/",
             composer: "#prompt-textarea, .ProseMirror[contenteditable=\"true\"], div[contenteditable=\"true\"][role=\"textbox\"]",
@@ -619,8 +628,9 @@ final class ChatModel: ObservableObject {
 
         do {
             switch provider {
-            case .claude: try askClaude(q, prior: prior, onDelta: onDelta, onDone: onDone)
-            case .chatgpt, .gemini: askWeb(provider, q, prior: prior, onReplace: onReplace, onDone: onDone)
+            case .claude where provider.site == nil: try askClaude(q, prior: prior, onDelta: onDelta, onDone: onDone)
+            case .claude
+            , .chatgpt, .gemini: askWeb(provider, q, prior: prior, onReplace: onReplace, onDone: onDone)
             }
         } catch {
             onDone(nil, error.localizedDescription)
