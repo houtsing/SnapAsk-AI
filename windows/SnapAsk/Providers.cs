@@ -16,7 +16,7 @@ public static class Sites
             "https://claude.ai/new",
             "div.ProseMirror[contenteditable=\"true\"], [data-testid=\"chat-input\"] [contenteditable=\"true\"]",
             "button[aria-label=\"Send message\"], button[aria-label=\"Send Message\"]",
-            ".font-claude-response, [data-testid=\"assistant-message\"]",
+            "[data-testid=\"assistant-message\"] .standard-markdown, .font-claude-response .standard-markdown",
             "button[aria-label=\"Stop response\"], [data-is-streaming=\"true\"]"),
         Provider.ChatGPT => new Site(
             "https://chatgpt.com/",

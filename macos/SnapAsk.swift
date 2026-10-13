@@ -40,7 +40,7 @@ enum Provider: String, CaseIterable, Identifiable {
                 url: "https://claude.ai/new",
                 composer: "div.ProseMirror[contenteditable=\"true\"], [data-testid=\"chat-input\"] [contenteditable=\"true\"]",
                 send: "button[aria-label=\"Send message\"], button[aria-label=\"Send Message\"]",
-                reply: ".font-claude-response, [data-testid=\"assistant-message\"]",
+                reply: "[data-testid=\"assistant-message\"] .standard-markdown, .font-claude-response .standard-markdown",
                 stop: "button[aria-label=\"Stop response\"], [data-is-streaming=\"true\"]")
         case .chatgpt: return WebSite(
             url: "https://chatgpt.com/",

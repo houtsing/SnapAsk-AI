@@ -14,8 +14,8 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'
       - name: Publish single-file SnapAsk.exe
@@ -26,7 +26,7 @@ jobs:
       - name: Zip
         shell: pwsh
         run: Compress-Archive -Path out/SnapAsk.exe -DestinationPath SnapAsk-Windows-x64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: SnapAsk-Windows-x64
           path: SnapAsk-Windows-x64.zip
@@ -34,12 +34,12 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build SnapAsk.app (ad-hoc signed)
         run: ./macos/build.sh --no-install
       - name: Zip
         run: cd macos/build && ditto -c -k --keepParent SnapAsk.app ../../SnapAsk-macOS-arm64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: SnapAsk-macOS-arm64
           path: SnapAsk-macOS-arm64.zip
@@ -49,7 +49,7 @@ jobs:
     needs: [windows, macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
       - name: Create GitHub release
