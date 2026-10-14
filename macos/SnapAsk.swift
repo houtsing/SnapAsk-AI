@@ -926,11 +926,23 @@ final class AskPanel: NSPanel, NSWindowDelegate {
     override func cancelOperation(_ sender: Any?) { close() }
 
     // Grow downward as the conversation gets longer; flip upward if we'd run off the screen.
+    // Moving the window while AppKit is mid-layout (this callback can fire inside a layout pass) makes it
+    // re-run layout recursively until it aborts the app, so reposition on the next run-loop turn instead.
+    private var repositionPending = false
+
     func windowDidResize(_ notification: Notification) {
-        guard let vf = screen?.visibleFrame else { return }
-        var tl = topLeft
-        if tl.y - frame.height < vf.minY { tl.y = vf.minY + frame.height }
-        setFrameTopLeftPoint(tl)
+        guard !repositionPending else { return }
+        repositionPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.repositionPending = false
+            guard let vf = self.screen?.visibleFrame ?? NSScreen.main?.visibleFrame else { return }
+            var tl = self.topLeft
+            if tl.y - self.frame.height < vf.minY { tl.y = vf.minY + self.frame.height }
+            tl.y = min(tl.y, vf.maxY)
+            let current = NSPoint(x: self.frame.minX, y: self.frame.maxY)
+            if abs(current.x - tl.x) > 0.5 || abs(current.y - tl.y) > 0.5 { self.setFrameTopLeftPoint(tl) }
+        }
     }
     func windowDidMove(_ notification: Notification) {
         topLeft = NSPoint(x: frame.minX, y: frame.maxY)
@@ -1354,12 +1366,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func installDebugHooks() {
         let dnc = DistributedNotificationCenter.default()
         dnc.addObserver(forName: .init("com.snapask.debug.open"), object: nil, queue: .main) { n in
-            guard let src = n.object as? String else { return }
+            guard let arg = n.object as? String else { return }
+            // "path" or "path|x,y" (anchor point in screen coordinates)
+            let parts = arg.split(separator: "|").map(String.init)
+            let src = parts[0]
+            var anchor: NSPoint?
+            if parts.count > 1 {
+                let xy = parts[1].split(separator: ",").compactMap { Double($0) }
+                if xy.count == 2 { anchor = NSPoint(x: xy[0], y: xy[1]) }
+            }
             let dir = self.cacheRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let shot = dir.appendingPathComponent("snapshot.png")
             try? FileManager.default.copyItem(at: URL(fileURLWithPath: src), to: shot)
-            self.showPanel(dir: dir, shot: shot)
+            self.showPanel(dir: dir, shot: shot, at: anchor)
         }
         dnc.addObserver(forName: .init("com.snapask.debug.eval"), object: nil, queue: .main) { n in
             let p = Provider(rawValue: UserDefaults.standard.string(forKey: "provider") ?? "") ?? .chatgpt
@@ -1392,8 +1412,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func showPanel(dir: URL, shot: URL) {
-        let panel = AskPanel(model: ChatModel(dir: dir, imageURL: shot), near: NSEvent.mouseLocation)
+    private func showPanel(dir: URL, shot: URL, at anchor: NSPoint? = nil) {
+        let panel = AskPanel(model: ChatModel(dir: dir, imageURL: shot), near: anchor ?? NSEvent.mouseLocation)
         panels.append(panel)
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
