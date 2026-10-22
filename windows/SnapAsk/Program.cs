@@ -26,6 +26,7 @@ public static class Program
         {
             Log.Write("launched");
             SetupTray();
+            HotKeys.RegisterRecall(Recall);
             if (!HotKeys.Register(Snap))
                 tray!.ShowBalloonTip(5000, "SnapAsk", $"{HotKeys.Current.Label} is used by another app. Pick another shortcut from the tray menu.", WinForms.ToolTipIcon.Warning);
             else
@@ -51,6 +52,13 @@ public static class Program
         finally { capturing = false; }
     }
 
+    /// Bring-back shortcut: the most recent popup to the front (or back down if it's already there).
+    public static void Recall()
+    {
+        if (Popup.Open.Count == 0) { System.Media.SystemSounds.Beep.Play(); return; }
+        Popup.Open[^1].BringBack(toggle: true);
+    }
+
     // ---- Tray icon & menu ----
 
     private static void SetupTray()
@@ -69,6 +77,7 @@ public static class Program
     {
         var m = new WinForms.ContextMenuStrip();
         m.Items.Add($"Snap && Ask    {HotKeys.Current.Label}", null, (_, _) => Snap());
+        m.Items.Add($"Bring back popup    {(HotKeys.Recall.Key == 0 ? "" : HotKeys.Recall.Label)}", null, (_, _) => Recall());
         m.Items.Add("Setup && accounts…", null, (_, _) => Accounts.ShowWindow());
         m.Items.Add(new WinForms.ToolStripSeparator());
 
@@ -94,6 +103,20 @@ public static class Program
             keys.DropDownItems.Add(it);
         }
         m.Items.Add(keys);
+
+        var recallKeys = new WinForms.ToolStripMenuItem("Bring-back shortcut");
+        foreach (var hk in HotKeys.RecallAll)
+        {
+            var it = new WinForms.ToolStripMenuItem(hk.Label) { Checked = HotKeys.Recall == hk };
+            it.Click += (_, _) =>
+            {
+                Settings.Current.RecallHotKey = hk.Label; Settings.Current.Save();
+                if (!HotKeys.RegisterRecall(Recall)) MessageBox.Show($"{hk.Label} is already used by another app. Pick a different one.", "SnapAsk");
+                RebuildMenu();
+            };
+            recallKeys.DropDownItems.Add(it);
+        }
+        m.Items.Add(recallKeys);
 
         var signIn = new WinForms.ToolStripMenuItem("Sign in / open full chat");
         foreach (Provider p in Enum.GetValues(typeof(Provider)))

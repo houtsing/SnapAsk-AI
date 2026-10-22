@@ -33,6 +33,9 @@ public sealed class WebBackend
             if (p != Provider.Claude || !ClaudeCli.InUse) Get(p);
     }
 
+    /// Backend already created for `p`, without creating one.
+    public static WebBackend? Existing(Provider p) => all.GetValueOrDefault(p);
+
     private static Task<CoreWebView2Environment> Env() => env ??= CoreWebView2Environment.CreateAsync(
         null, Path.Combine(Log.Dir, "WebView2"),
         new CoreWebView2EnvironmentOptions(
@@ -52,6 +55,7 @@ public sealed class WebBackend
     public Guid? Owner { get; private set; }   // the popup whose conversation is on the page
     private bool fresh = true;                 // page is an untouched new chat
     private int generation;                    // bumps on reset; stale polls stop
+    private bool needsSettle;                  // a saved conversation was just opened; let it render first
 
     private WebBackend(Provider p)
     {
@@ -60,7 +64,8 @@ public sealed class WebBackend
         web = new WebView2();
         host = new Window
         {
-            Title = p.ToString(), Width = 1000, Height = 860, Left = -32000, Top = -32000,
+            // Desktop width, so the sites show their chat history sidebar.
+            Title = p.ToString(), Width = 1280, Height = 860, Left = -32000, Top = -32000,
             ShowInTaskbar = false, ShowActivated = false, WindowStyle = WindowStyle.None,
             ResizeMode = ResizeMode.NoResize, Content = web,
         };
@@ -109,6 +114,43 @@ public sealed class WebBackend
 
     public void Release(Guid id) { if (Owner == id) _ = ResetAsync(); }
 
+    /// Recent conversations from the site's sidebar (newest first).
+    public async Task<List<ChatRef>> ListChatsAsync()
+    {
+        await ready;
+        if (navigation is { } nav) await Task.WhenAny(nav.Task, Task.Delay(30000));
+        try
+        {
+            var r = await RunAsync(Sites.ListJs, new Dictionary<string, object> { ["pattern"] = site.ChatLink }, TimeSpan.FromSeconds(5));
+            if (r.ValueKind != JsonValueKind.Array) return new();
+            return r.EnumerateArray()
+                .Select(e => new ChatRef(e.GetProperty("title").GetString() ?? "", e.GetProperty("url").GetString() ?? ""))
+                .Where(c => c.Title.Length > 0).ToList();
+        }
+        catch { return new(); }
+    }
+
+    /// The saved conversation on the page, if it is one (a new chat gets its URL after the first reply).
+    public string? CurrentChatUrl
+    {
+        get
+        {
+            string? u = web.CoreWebView2?.Source;
+            return u != null && System.Text.RegularExpressions.Regex.IsMatch(u, site.ChatLink) ? u : null;
+        }
+    }
+
+    /// Put popup `id`'s saved conversation on the page (loads in the background while you type).
+    public async Task OpenAsync(Guid id, string url)
+    {
+        generation++;
+        Owner = id;
+        fresh = false;
+        needsSettle = true;
+        await ready;
+        await NavigateAsync(url);
+    }
+
     public static void ReleaseAll(Guid id) { foreach (var b in all.Values) b.Release(id); }
 
     /// true = signed in, false = not signed in, null = still loading / unknown.
@@ -156,13 +198,18 @@ public sealed class WebBackend
 
     // ---- Asking ----
 
-    /// Sends one question (attaching `png` when given) and streams the reply text through `onUpdate`.
+    /// Sends one question with `images` attached and streams the reply text through `onUpdate`.
+    /// `url`: this popup's saved conversation, reopened if another popup has used the page since.
     /// Returns null on success, otherwise an error message.
-    public async Task<string?> AskAsync(Guid id, string text, byte[]? png, Action<string> onUpdate)
+    public async Task<string?> AskAsync(Guid id, string? url, string text, IReadOnlyList<byte[]> images, Action<string> onUpdate)
     {
         await ready;
-        if (Owner != id && !fresh) await ResetAsync();   // another popup's chat is on the page
+        if (Owner != id && url != null) await OpenAsync(id, url);   // our conversation was replaced; bring it back
+        else if (Owner != id && !fresh) await ResetAsync();         // another popup's chat is on the page
+        if (navigation is { } nav) await Task.WhenAny(nav.Task, Task.Delay(30000));
         Owner = id;
+        bool settle = needsSettle;
+        needsSettle = false;
         fresh = false;
         int gen = generation;
 
@@ -172,7 +219,7 @@ public sealed class WebBackend
             r = await RunAsync(Sites.AskJs, new Dictionary<string, object>
             {
                 ["composer"] = site.Composer, ["send"] = site.Send, ["reply"] = site.Reply,
-                ["b64"] = png == null ? "" : Convert.ToBase64String(png), ["text"] = text,
+                ["imgs"] = images.Select(Convert.ToBase64String).ToArray(), ["text"] = text, ["settle"] = settle,
             }, TimeSpan.FromSeconds(120));
         }
         catch (Exception ex) { return $"Couldn't send to {Provider} ({ex.Message}). Try “Open full chat”."; }

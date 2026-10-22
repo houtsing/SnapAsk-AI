@@ -5,6 +5,7 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -15,18 +16,24 @@ using WinForms = System.Windows.Forms;
 
 namespace SnapAsk;
 
-/// The floating "ask about this snapshot" window.
+/// The "ask about this snapshot" window. An ordinary window: others can cover it, and the
+/// bring-back shortcut (or the taskbar / Alt+Tab) returns to it.
 public sealed class Popup : Window
 {
     private sealed class Msg
     {
-        public string Role = "";   // "You" or provider name
+        public string Role = "";   // "You", provider name, or "" for a note
         public string Text = "";
         public bool IsError;
+        public List<byte[]> Images = new();
         public TextBlock? View;
         public StackPanel? Box;
         public bool IsUser => Role == "You";
+        public bool IsNote => Role.Length == 0;
     }
+
+    /// Open popups, most recently used last (the one the bring-back shortcut returns to).
+    public static readonly List<Popup> Open = new();
 
     private static readonly Brush Bg = new SolidColorBrush(Color.FromRgb(0x2B, 0x2A, 0x28));
     private static readonly Brush Card = new SolidColorBrush(Color.FromArgb(18, 255, 255, 255));
@@ -40,6 +47,12 @@ public sealed class Popup : Window
     private readonly System.Drawing.Point anchor;
     private readonly List<Msg> messages = new();
     private readonly Dictionary<Provider, int> synced = new();   // messages already on each site's page
+    private readonly Dictionary<Provider, string> chatUrl = new();   // this popup's conversation on each site
+    private readonly HashSet<Provider> snapshotSent = new();     // the snapshot is already in that conversation
+    private readonly Dictionary<Provider, List<ChatRef>> chats = new();
+    private bool claudeWeb;                                     // Claude via claude.ai here (a claude.ai chat was resumed)
+    private readonly List<byte[]> pending = new();               // images for the next message
+    private readonly WrapPanel pendingRow = new() { Margin = new Thickness(12, 10, 12, 0), Visibility = Visibility.Collapsed };
     private readonly Dictionary<Provider, Button> tabs = new();
     private Provider provider;
     private bool busy;
@@ -66,8 +79,7 @@ public sealed class Popup : Window
         AllowsTransparency = true;
         Background = Brushes.Transparent;
         ResizeMode = ResizeMode.NoResize;
-        Topmost = true;
-        ShowInTaskbar = false;
+        ShowInTaskbar = true;
         FontFamily = new FontFamily("Segoe UI");
         FontSize = 14;
         Foreground = Fg;
@@ -97,11 +109,13 @@ public sealed class Popup : Window
         close.Click += (_, _) => Close();
         var full = new Button { Content = "Open full chat ↗", Foreground = Accent, Background = Brushes.Transparent, BorderThickness = new Thickness(0), FontSize = 11, Cursor = Cursors.Hand, Template = FlatButton() };
         full.Click += (_, _) => Accounts.SignIn(provider);
-        var hint = new TextBlock { Text = "Ctrl+1 / 2 / 3 to switch", Foreground = Dim, FontSize = 11, Margin = new Thickness(10, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center };
+        var chatsButton = new Button { Content = "Chats ▾", Foreground = Fg, Background = Brushes.Transparent, BorderThickness = new Thickness(0), FontSize = 11, Margin = new Thickness(0, 0, 10, 0), Cursor = Cursors.Hand, Template = FlatButton(), ToolTip = "Start a new chat or continue a saved one" };
+        chatsButton.Click += (_, _) => ShowChatsMenu(chatsButton);
+        var hint = new TextBlock { Text = "Ctrl+1/2/3", Foreground = Dim, FontSize = 11, Margin = new Thickness(10, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center, ToolTip = "Ctrl+1 / 2 / 3 switch between Claude, ChatGPT and Gemini" };
 
         var right = new StackPanel { HorizontalAlignment = HorizontalAlignment.Right };
         right.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Children = { tabBox, close } });
-        right.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 6, 0, 0), Children = { full, hint } });
+        right.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 6, 0, 0), Children = { chatsButton, full, hint } });
 
         var header = new Grid { Margin = new Thickness(12), Background = Brushes.Transparent };
         header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -123,6 +137,11 @@ public sealed class Popup : Window
         };
         placeholder = new TextBlock { Text = "Ask about this snapshot…", Foreground = Dim, IsHitTestVisible = false, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(2, 0, 0, 0) };
         input.TextChanged += (_, _) => placeholder.Visibility = input.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        // Ctrl+V with an image (or image files) on the clipboard attaches it to the next message.
+        CommandManager.AddPreviewExecutedHandler(input, (_, e) =>
+        {
+            if (e.Command == ApplicationCommands.Paste && PasteImages()) e.Handled = true;
+        });
         input.PreviewKeyDown += (_, e) =>
         {
             if (e.Key == Key.Enter && Keyboard.Modifiers == ModifierKeys.Shift)
@@ -133,15 +152,23 @@ public sealed class Popup : Window
         };
         sendButton = new Button { Content = "↑", Width = 28, Height = 28, FontWeight = FontWeights.Bold, Foreground = Brushes.White, Background = Accent, BorderThickness = new Thickness(0), Cursor = Cursors.Hand, Template = RoundButton() };
         sendButton.Click += (_, _) => Send();
+        var snapButton = new Button { Content = "📷", Width = 28, Height = 28, Foreground = Dim, Background = Brushes.Transparent, BorderThickness = new Thickness(0), Cursor = Cursors.Hand, Template = FlatButton(), ToolTip = "Snap another area of the screen and attach it" };
+        snapButton.Click += (_, _) => SnapAttachment();
         var inputGrid = new Grid { Margin = new Thickness(12) };
         inputGrid.ColumnDefinitions.Add(new ColumnDefinition());
         inputGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        inputGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         inputGrid.Children.Add(input);
         inputGrid.Children.Add(placeholder);
-        Grid.SetColumn(sendButton, 1);
+        Grid.SetColumn(snapButton, 1);
+        snapButton.Margin = new Thickness(8, 0, 0, 0);
+        inputGrid.Children.Add(snapButton);
+        Grid.SetColumn(sendButton, 2);
         sendButton.Margin = new Thickness(8, 0, 0, 0);
         inputGrid.Children.Add(sendButton);
-        var inputArea = new Border { BorderBrush = Divider, BorderThickness = new Thickness(0, 1, 0, 0), Child = inputGrid };
+        var inputArea = new Border { BorderBrush = Divider, BorderThickness = new Thickness(0, 1, 0, 0), Child = new StackPanel { Children = { pendingRow, inputGrid } } };
+        AllowDrop = true;
+        Drop += (_, e) => { foreach (var img in ImagesFrom(e.Data)) AddPending(img); };
 
         var root = new StackPanel();
         root.Children.Add(header);
@@ -163,12 +190,15 @@ public sealed class Popup : Window
             }
         };
         SourceInitialized += (_, _) => PlaceNearAnchor();
-        Loaded += (_, _) => { Activate(); input.Focus(); };
+        Loaded += (_, _) => { Activate(); input.Focus(); _ = LoadChatsAsync(); };
+        Activated += (_, _) => { Open.Remove(this); Open.Add(this); };
         Closed += (_, _) =>
         {
+            Open.Remove(this);
             claudeCli?.Dispose();
             WebBackend.ReleaseAll(id);
         };
+        Open.Add(this);
         SetProvider(provider);
     }
 
@@ -178,6 +208,174 @@ public sealed class Popup : Window
         Settings.Current.Provider = p;
         Settings.Current.Save();
         foreach (var (tp, b) in tabs) b.Background = tp == p ? Accent : Brushes.Transparent;
+        if (IsLoaded) _ = LoadChatsAsync();
+    }
+
+    private bool UsesWeb(Provider p) => p != Provider.Claude || !ClaudeCli.InUse || claudeWeb;
+
+    /// Bring-back shortcut: in front and ready to type; if it already is, back behind your work.
+    public void BringBack(bool toggle)
+    {
+        if (toggle && IsActive && WindowState != WindowState.Minimized) { WindowState = WindowState.Minimized; return; }
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        Show();
+        Activate();
+        input.Focus();
+    }
+
+    // ---- Resuming a saved conversation ----
+
+    private async Task LoadChatsAsync()
+    {
+        var p = provider;
+        var list = await WebBackend.Get(p).ListChatsAsync();
+        if (list.Count > 0 || !chats.ContainsKey(p)) chats[p] = list;
+    }
+
+    private void ShowChatsMenu(Button anchorButton)
+    {
+        var menu = new ContextMenu { PlacementTarget = anchorButton, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
+        var fresh = new MenuItem { Header = "New chat", IsEnabled = !busy };
+        fresh.Click += (_, _) => NewChat();
+        menu.Items.Add(fresh);
+        menu.Items.Add(new Separator());
+        var list = chats.GetValueOrDefault(provider) ?? new List<ChatRef>();
+        if (list.Count == 0) menu.Items.Add(new MenuItem { Header = chats.ContainsKey(provider) ? "No saved chats found" : "Loading…", IsEnabled = false });
+        else
+        {
+            menu.Items.Add(new MenuItem { Header = $"Continue a {provider} chat:", IsEnabled = false });
+            foreach (var c in list)
+            {
+                var it = new MenuItem { Header = c.Title.Replace("_", "__"), IsEnabled = !busy };
+                it.Click += (_, _) => Resume(c);
+                menu.Items.Add(it);
+            }
+        }
+        menu.Items.Add(new Separator());
+        var refresh = new MenuItem { Header = "Refresh list" };
+        refresh.Click += async (_, _) => { await LoadChatsAsync(); ShowChatsMenu(anchorButton); };
+        menu.Items.Add(refresh);
+        menu.IsOpen = true;
+    }
+
+    /// Continue `c` instead of starting a new chat: the next question (with the snapshot) goes there.
+    private void Resume(ChatRef c)
+    {
+        var p = provider;
+        if (busy) return;
+        if (p == Provider.Claude && ClaudeCli.InUse) claudeWeb = true;
+        chatUrl[p] = c.Url;
+        synced[p] = 0;              // anything already asked here gets passed along as context
+        snapshotSent.Remove(p);
+        _ = WebBackend.Get(p).OpenAsync(id, c.Url);
+        AddMessage(new Msg { Text = $"↪ Continuing “{c.Title}” in {p}" });
+        input.Focus();
+    }
+
+    private void NewChat()
+    {
+        var p = provider;
+        if (busy) return;
+        if (p == Provider.Claude) { claudeWeb = false; claudeCli?.Dispose(); claudeCli = null; claudeCliSynced = messages.Count; }
+        chatUrl.Remove(p);
+        synced[p] = messages.Count;   // a clean slate: don't replay this popup's earlier turns
+        snapshotSent.Remove(p);
+        if (WebBackend.Existing(p) is { } b && b.Owner == id) _ = b.ResetAsync();
+        AddMessage(new Msg { Text = $"↪ New {p} chat" });
+        input.Focus();
+    }
+
+    // ---- Extra images (paste, drop, camera button) ----
+
+    private bool PasteImages()
+    {
+        var found = ImagesFrom(Clipboard.GetDataObject());
+        foreach (var img in found) AddPending(img);
+        return found.Count > 0;
+    }
+
+    /// Images in a clipboard / drag payload: image files, or bitmap data (unless it's text with a picture attached).
+    private static List<byte[]> ImagesFrom(IDataObject? data)
+    {
+        var result = new List<byte[]>();
+        if (data == null) return result;
+        if (data.GetDataPresent(DataFormats.FileDrop) && data.GetData(DataFormats.FileDrop) is string[] files)
+        {
+            foreach (var f in files)
+            {
+                try
+                {
+                    var ext = Path.GetExtension(f).ToLowerInvariant();
+                    if (ext is ".png" or ".jpg" or ".jpeg" or ".gif" or ".bmp" or ".webp")
+                        result.Add(ToPng(new BitmapImage(new Uri(f))));
+                }
+                catch (Exception ex) { Log.Write($"couldn't read {f}: {ex.Message}"); }
+            }
+            return result;
+        }
+        if (data.GetDataPresent(DataFormats.UnicodeText)) return result;
+        if (data.GetDataPresent(DataFormats.Bitmap) && data.GetData(DataFormats.Bitmap) is BitmapSource bmp)
+            result.Add(ToPng(bmp));
+        return result;
+    }
+
+    private static byte[] ToPng(BitmapSource src)
+    {
+        var enc = new PngBitmapEncoder();
+        enc.Frames.Add(BitmapFrame.Create(src));
+        using var ms = new MemoryStream();
+        enc.Save(ms);
+        return ms.ToArray();
+    }
+
+    private void SnapAttachment()
+    {
+        if (busy) return;
+        Hide();
+        try
+        {
+            var picked = RegionSelector.Pick();
+            if (picked is { } p)
+            {
+                using var ms = new MemoryStream();
+                p.image.Save(ms, ImageFormat.Png);
+                AddPending(ms.ToArray());
+            }
+        }
+        catch (Exception ex) { Log.Write($"capture failed: {ex}"); }
+        finally { BringBack(false); }
+    }
+
+    private void AddPending(byte[] img)
+    {
+        pending.Add(img);
+        RenderPending();
+        input.Focus();
+    }
+
+    private void RenderPending()
+    {
+        pendingRow.Children.Clear();
+        foreach (var img in pending.ToList())
+        {
+            var remove = new Button { Content = "✕", FontSize = 9, Width = 16, Height = 16, Foreground = Brushes.White, Background = new SolidColorBrush(Color.FromArgb(160, 0, 0, 0)), BorderThickness = new Thickness(0), Cursor = Cursors.Hand, Template = RoundButton(), HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, -4, -4, 0), ToolTip = "Remove" };
+            remove.Click += (_, _) => { pending.Remove(img); RenderPending(); };
+            pendingRow.Children.Add(new Grid { Margin = new Thickness(0, 0, 8, 0), Children = { Thumb(img), remove } });
+        }
+        pendingRow.Visibility = pending.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    private static Image Thumb(byte[] png) =>
+        new() { Source = ToBitmapSource(png), MaxHeight = 44, MaxWidth = 100, Stretch = Stretch.Uniform, HorizontalAlignment = HorizontalAlignment.Left };
+
+    /// The snapshot (first time in a conversation), images from turns the AI hasn't seen, and new ones.
+    private List<byte[]> ImagesToSend(bool snapshot, List<Msg> missed, List<byte[]> extra)
+    {
+        var list = new List<byte[]>();
+        if (snapshot) list.Add(png);
+        list.AddRange(missed.SelectMany(m => m.Images));
+        list.AddRange(extra);
+        return list;
     }
 
     // ---- Conversation ----
@@ -187,26 +385,37 @@ public sealed class Popup : Window
         string q = input.Text.Trim();
         if (q.Length == 0 || busy) return;
         input.Text = "";
+        var extra = pending.ToList();
+        pending.Clear();
+        RenderPending();
         var prior = messages.ToList();
-        AddMessage(new Msg { Role = "You", Text = q });
+        AddMessage(new Msg { Role = "You", Text = q, Images = extra });
         var reply = new Msg { Role = provider.ToString() };
         AddMessage(reply);
         SetBusy(true);
 
         var p = provider;
-        if (p == Provider.Claude && ClaudeCli.InUse) { AskClaudeCli(q, prior, reply); return; }
+        if (!UsesWeb(p)) { AskClaudeCli(q, prior, extra, reply); return; }
         var backend = WebBackend.Get(p);
-        bool isFirst = backend.Owner != id;   // new chat on that site: send the image + earlier context
-        if (isFirst) synced[p] = 0;
+        // No conversation of ours on this site yet (or it was reset): start one, with the snapshot and context.
+        bool isNew = !chatUrl.ContainsKey(p) && backend.Owner != id;
+        if (isNew) { synced[p] = 0; snapshotSent.Remove(p); }
         var missed = prior.Skip(Math.Min(synced.GetValueOrDefault(p), prior.Count)).ToList();
         string text = Transcript(missed, q);
-        if (isFirst) text = Sites.SystemPrompt + "\n\n" + text;
+        if (isNew) text = Sites.SystemPrompt + "\n\n" + text;
+        var images = ImagesToSend(!snapshotSent.Contains(p), missed, extra);
 
-        _ = backend.AskAsync(id, text, isFirst ? png : null, t => Dispatcher.Invoke(() => Update(reply, t)))
+        _ = backend.AskAsync(id, chatUrl.GetValueOrDefault(p), text, images, t => Dispatcher.Invoke(() => Update(reply, t)))
             .ContinueWith(task => Dispatcher.Invoke(() =>
             {
                 string? err = task.IsFaulted ? task.Exception?.GetBaseException().Message : task.Result;
-                if (err == null) synced[p] = messages.Count;
+                if (err == null)
+                {
+                    synced[p] = messages.Count;
+                    snapshotSent.Add(p);
+                    if (backend.CurrentChatUrl is { } u) chatUrl[p] = u;
+                    _ = LoadChatsAsync();
+                }
                 Finish(reply, err, p);
             }));
     }
@@ -228,7 +437,7 @@ public sealed class Popup : Window
         SetBusy(false);
     }
 
-    private void AskClaudeCli(string q, List<Msg> prior, Msg reply)
+    private void AskClaudeCli(string q, List<Msg> prior, List<byte[]> extra, Msg reply)
     {
         try
         {
@@ -236,7 +445,7 @@ public sealed class Popup : Window
             if (isNew) { claudeCli?.Dispose(); claudeCli = new ClaudeCli.Session(); claudeCliSynced = 0; }
             var missed = prior.Skip(Math.Min(claudeCliSynced, prior.Count)).ToList();
             claudeCliSynced = messages.Count;
-            _ = claudeCli!.AskAsync(Transcript(missed, q), isNew ? png : null,
+            _ = claudeCli!.AskAsync(Transcript(missed, q), ImagesToSend(isNew, missed, extra),
                     d => Dispatcher.Invoke(() => Update(reply, reply.Text + d)))
                 .ContinueWith(t => Dispatcher.Invoke(() =>
                     Finish(reply, t.IsFaulted ? t.Exception?.GetBaseException().Message : t.Result, Provider.Claude)));
@@ -246,7 +455,7 @@ public sealed class Popup : Window
 
     private static string Transcript(List<Msg> history, string question)
     {
-        var turns = history.Where(m => !m.IsError && m.Text.Length > 0).ToList();
+        var turns = history.Where(m => !m.IsError && !m.IsNote && m.Text.Length > 0).ToList();
         if (turns.Count == 0) return question;
         string past = string.Join("\n\n", turns.Select(m => $"{(m.IsUser ? "User" : "Assistant")}: {m.Text}"));
         return $"Earlier in this conversation about the screenshot:\n\n{past}\n\nNew question: {question}";
@@ -256,10 +465,23 @@ public sealed class Popup : Window
     {
         messages.Add(m);
         listArea.Visibility = Visibility.Visible;
-        placeholder.Text = "Follow-up…";
+        placeholder.Text = "Follow-up…  (Ctrl+V pastes an image)";
+        if (m.IsNote)
+        {
+            list.Children.Add(new TextBlock { Text = m.Text, Foreground = Dim, FontSize = 11, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 12) });
+            scroller.ScrollToEnd();
+            return;
+        }
         var role = new TextBlock { Text = m.Role, Foreground = Dim, FontSize = 11, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 4) };
         m.View = new TextBlock { TextWrapping = TextWrapping.Wrap, Foreground = Fg };
-        var stack = new StackPanel { Children = { role, m.View } };
+        var stack = new StackPanel { Children = { role } };
+        if (m.Images.Count > 0)
+        {
+            var row = new WrapPanel { Margin = new Thickness(0, 0, 0, 4) };
+            foreach (var img in m.Images) { var t = Thumb(img); t.Margin = new Thickness(0, 0, 6, 0); row.Children.Add(t); }
+            stack.Children.Add(row);
+        }
+        stack.Children.Add(m.View);
         m.Box = stack;
         list.Children.Add(m.IsUser
             ? new Border { Child = stack, Margin = new Thickness(0, 0, 0, 12) }

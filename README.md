@@ -20,12 +20,15 @@ SnapAsk turns that into **one shortcut**. It works in any app (Preview, PowerPoi
 
 - **Global shortcut**: **fn + ⌃ + S** on Mac and **Ctrl + Alt + S** on Windows by default (both changeable).
 - **Region capture**: the native selector on macOS (press **Space** to grab a whole window) and a dimmed drag-to-select overlay on Windows.
-- **Floating popup** next to where you made the snapshot. It stays on top until you close it (**Esc**).
+- **Popup** next to where you made the snapshot. It's an ordinary window, so your work can cover it. Close it with **Esc**.
+- **Bring-back shortcut**: **fn + ⌃ + A** (Mac) or **Ctrl + Alt + A** (Windows) brings the last popup back in front of your work, ready for the next question in the same chat. Press it again to send the popup back. SnapAsk also shows in the Dock / ⌘Tab (Mac) or the taskbar / Alt+Tab (Windows) while a popup is open.
 - **Three AIs, one box:** **Claude**, **ChatGPT** and **Gemini**. Switch with ⌘1/⌘2/⌘3 (Mac) or Ctrl+1/2/3 (Windows).
 - **Your own accounts, no API keys:** each AI runs through its real website (claude.ai, chatgpt.com, gemini.google.com), loaded in a hidden page in the background and signed in to your account. This works on free plans, and with school or work accounts that block third-party tools.
   - **Claude Code CLI users:** if `claude` is installed and signed in, SnapAsk uses it for Claude automatically. It's slightly faster, and you don't need to sign in again. You can also force either route.
 - **Streaming answers** with bold, bullet lists and code.
 - **Follow-up questions** keep the conversation going. If you switch AIs midway, the new one gets the snapshot and the conversation so far.
+- **More images in follow-ups**: paste one (**⌘V** / **Ctrl+V**, e.g. a screenshot you copied to the clipboard), drop an image file on the popup, or click the camera button to snap another area. It goes with your next message.
+- **Continue a saved chat**: **Chats ▾** lists your recent conversations on the selected AI's site. Pick one and your next question (with the snapshot) goes into that chat instead of a new one. **New chat** starts over.
 - **Open full chat ↗** shows the real website for that conversation.
 - **Setup window** with sign-in status for each AI and one-click **Sign in** buttons.
 - Lives in the **menu bar** (Mac) or **system tray** (Windows). Optional start at login.
@@ -118,8 +121,18 @@ The setup window opens on first launch. See [Signing in](#signing-in-to-claude-c
 
 1. Press **fn + ⌃ + S** (or your chosen shortcut) and drag over an area.
 2. Type your question and press **Return**. Ask follow-ups, switch AIs with **⌘1 / ⌘2 / ⌘3**, and close with **Esc**.
+3. Go back to work. Other windows can cover the popup. When you want to ask more, press **fn + ⌃ + A** to bring it back to the same chat. Press it again to hide it.
 
-Menu bar icon: Snap & Ask, shortcut and permissions, default AI, sign in, Launch at Login, Quit.
+| Key | Action |
+|---|---|
+| **fn + ⌃ + S** | Snap & ask |
+| **fn + ⌃ + A** | Bring back the last popup / send it back |
+| **Return** | Send |
+| **⌘V** | Paste an image into the next message (text pastes as usual) |
+| **⌘1 / ⌘2 / ⌘3** | Switch to Claude / ChatGPT / Gemini |
+| **⌘M** / **⌘W** or **Esc** | Minimise / close the popup |
+
+You can change both shortcuts in **Setup & Accounts** (the fn shortcuts need the Accessibility permission). Menu bar icon: Snap & Ask, Bring Back Popup, setup, default AI, sign in, Launch at Login, Quit.
 
 ### Options
 
@@ -173,10 +186,12 @@ SnapAsk appears as a **viewfinder icon in the system tray** (bottom-right; it ma
 | Key | Action |
 |---|---|
 | **Enter** / **Shift + Enter** | Send / new line |
+| **Ctrl + Alt + A** | Bring back the last popup (press again to minimise it) |
+| **Ctrl + V** | Paste an image into the next message (text pastes as usual) |
 | **Ctrl + 1 / 2 / 3** | Switch to Claude / ChatGPT / Gemini |
 | **Esc** | Close the popup (or cancel a selection) |
 
-Tray menu: Snap & Ask, Setup & accounts, default AI, **Shortcut** (Ctrl+Alt+S, Ctrl+Shift+Space, Alt+Shift+A, Ctrl+Shift+2, Ctrl+Alt+Shift+S), sign in, **Start with Windows**, Quit. Double-click the tray icon to snap.
+Tray menu: Snap & Ask, Bring back popup, Setup & accounts, default AI, **Shortcut** (Ctrl+Alt+S, Ctrl+Shift+Space, Alt+Shift+A, Ctrl+Shift+2, Ctrl+Alt+Shift+S), **Bring-back shortcut** (Ctrl+Alt+A, Ctrl+Alt+R, Ctrl+Shift+1, Alt+Shift+S, Off), sign in, **Start with Windows**, Quit. Double-click the tray icon to snap.
 
 ### Where SnapAsk stores things
 
@@ -209,7 +224,8 @@ Tray menu: Snap & Ask, Setup & accounts, default AI, **Shortcut** (Ctrl+Alt+S, C
 | Hidden pages | `WKWebView` in an off-screen window (occlusion detection off) | WebView2 in an off-screen window (background throttling off) |
 
 - Each site loads once at launch, so asking is immediate. A question attaches the PNG to the site's own box (synthetic paste, then the page's file input, then drag-and-drop as fallbacks), types the text, clicks send, then reads the newest reply every 250 ms and turns it into lightweight markdown (bold, lists, code, LaTeX).
-- Each new snapshot starts a fresh chat. Follow-ups stay in that chat. When you switch AIs midway, the earlier turns go along with the next question.
+- Each new snapshot starts a fresh chat, unless you pick a saved one from **Chats ▾** (read from the site's own history sidebar). Follow-ups stay in that chat. When you switch AIs midway, the earlier turns go along with the next question.
+- The popup remembers its chat's address on each site. If another popup uses the same hidden page in between, the next follow-up reopens your chat first, so nothing is lost or replayed.
 - The page-automation scripts are in `windows/SnapAsk/Scripts/` (and inline in `macos/SnapAsk.swift`). The CSS selectors for each site are at the top of `macos/SnapAsk.swift` and in `windows/SnapAsk/Providers.cs`.
 
 ## Project layout
@@ -224,9 +240,9 @@ windows/SnapAsk/
   Program.cs        tray icon, menu, startup
   Accounts.cs       setup window: sign-in status, Sign in buttons, Claude route
   ClaudeCli.cs      Claude Code CLI route (detection + streaming session)
-  HotKeys.cs        global shortcut
+  HotKeys.cs        global shortcuts (snap, bring back)
   Capture.cs        drag-to-select screen overlay
-  Popup.cs          the floating ask window
+  Popup.cs          the ask window (chats menu, image paste, bring-back)
   WebBackend.cs     hidden WebView2 pages that talk to each site
   Providers.cs      per-site CSS selectors + system prompt
   Markdown.cs       reply formatting

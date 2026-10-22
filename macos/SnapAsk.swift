@@ -1,5 +1,5 @@
-// SnapAsk — press ⌘⇧2, drag over any part of the screen, ask Claude / ChatGPT / Gemini about it.
-// Claude goes through the `claude` CLI; ChatGPT and Gemini run their real websites in an embedded web view — all with your own accounts.
+// SnapAsk — press fn⌃S, drag over any part of the screen, ask Claude / ChatGPT / Gemini about it.
+// Each AI runs through its real website in a hidden web view (or Claude through the Claude Code CLI) — all with your own accounts.
 
 import Cocoa
 import SwiftUI
@@ -85,29 +85,34 @@ enum Provider: String, CaseIterable, Identifiable {
         let m = UserDefaults.standard.string(forKey: defaultsKey)?.trimmingCharacters(in: .whitespaces)
         return (m?.isEmpty ?? true) ? nil : m
     }
-    /// Providers driven through their website (signed in with your own account).
-    var site: WebSite? {
+    /// Providers driven through their website (signed in with your own account). nil = Claude via the CLI.
+    var site: WebSite? { self == .claude && ClaudeRoute.usesCLI ? nil : webSite }
+
+    /// The provider's website, even when Claude normally goes through the CLI (used to resume a claude.ai chat).
+    var webSite: WebSite {
         switch self {
         case .claude:
-            if ClaudeRoute.usesCLI { return nil }   // Claude Code CLI instead of claude.ai
             return WebSite(
                 url: "https://claude.ai/new",
                 composer: "div.ProseMirror[contenteditable=\"true\"], [data-testid=\"chat-input\"] [contenteditable=\"true\"]",
                 send: "button[aria-label=\"Send message\"], button[aria-label=\"Send Message\"]",
                 reply: "[data-testid=\"assistant-message\"] .standard-markdown, .font-claude-response .standard-markdown",
-                stop: "button[aria-label=\"Stop response\"], [data-is-streaming=\"true\"]")
+                stop: "button[aria-label=\"Stop response\"], [data-is-streaming=\"true\"]",
+                chatLink: #"^(https://claude\.ai)?/chat/[\w-]+$"#)
         case .chatgpt: return WebSite(
             url: "https://chatgpt.com/",
             composer: "#prompt-textarea, .ProseMirror[contenteditable=\"true\"], div[contenteditable=\"true\"][role=\"textbox\"]",
             send: "button[data-testid=\"send-button\"], #composer-submit-button, form button[type=\"submit\"]",
             reply: "[data-markdown-text-style=\"assistant-message\"], [data-message-author-role=\"assistant\"] .markdown",
-            stop: "[data-testid=\"stop-button\"], button[aria-label^=\"Stop\"]")
+            stop: "[data-testid=\"stop-button\"], button[aria-label^=\"Stop\"]",
+            chatLink: #"^(https://chatgpt\.com)?(/g/[\w-]+)?/c/[\w-]+$"#)
         case .gemini: return WebSite(
             url: "https://gemini.google.com/app",
             composer: "rich-textarea .ql-editor, div.ql-editor[contenteditable=\"true\"]",
             send: "button.send-button, button[aria-label*=\"Send\"]",
             reply: "model-response message-content, model-response .markdown",
-            stop: "button[aria-label*=\"Stop\"], button.send-button.stop")
+            stop: "button[aria-label*=\"Stop\"], button.send-button.stop",
+            chatLink: #"^(https://gemini\.google\.com)?/app/[0-9a-f]{8,}$"#)
         }
     }
     var loginCommand: String {
@@ -200,14 +205,13 @@ final class ClaudeSession {
         try proc.run()
     }
 
-    func send(text: String, imageBase64: String?, onDelta: @escaping (String) -> Void,
+    func send(text: String, images: [Data], onDelta: @escaping (String) -> Void,
               onDone: @escaping (String?, String?) -> Void) {
         self.onDelta = onDelta
         self.onDone = onDone
         sawDelta = false
-        var content: [[String: Any]] = []
-        if let b64 = imageBase64 {
-            content.append(["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": b64]])
+        var content: [[String: Any]] = images.map {
+            ["type": "image", "source": ["type": "base64", "media_type": "image/png", "data": $0.base64EncodedString()]]
         }
         content.append(["type": "text", "text": text])
         let msg: [String: Any] = ["type": "user", "message": ["role": "user", "content": content]]
@@ -259,6 +263,13 @@ final class ClaudeSession {
 
 struct WebSite {
     let url: String, composer: String, send: String, reply: String, stop: String
+    let chatLink: String   // regex for a saved conversation's link (sidebar entries, the page URL)
+}
+
+/// A saved conversation on one of the sites, as listed in its sidebar.
+struct ChatRef: Identifiable, Hashable {
+    let title: String, url: String
+    var id: String { url }
 }
 
 final class WebChat: NSObject, WKNavigationDelegate, WKUIDelegate {
@@ -271,7 +282,7 @@ final class WebChat: NSObject, WKNavigationDelegate, WKUIDelegate {
         self.site = site
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .default()   // persistent cookies, so you stay signed in
-        webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 900, height: 900), configuration: cfg)
+        webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1280, height: 900), configuration: cfg)
         super.init()
         webView.customUserAgent = Self.userAgent
         webView.navigationDelegate = self
@@ -341,15 +352,14 @@ final class WebBackend {
     static var shared: [Provider: WebBackend] = [:]
 
     static func get(_ p: Provider) -> WebBackend? {
-        guard let site = p.site else { return nil }
         if let b = shared[p] { return b }
-        let b = WebBackend(provider: p, site: site)
+        let b = WebBackend(provider: p, site: p.webSite)
         shared[p] = b
         return b
     }
 
     /// Start every web provider loading in the background so the first question is instant.
-    static func prewarmAll() { Provider.allCases.forEach { _ = get($0) } }
+    static func prewarmAll() { Provider.allCases.filter { $0.site != nil }.forEach { _ = get($0) } }
     static func reloadAll() { shared.values.forEach { $0.reset() } }
 
     let provider: Provider
@@ -364,7 +374,8 @@ final class WebBackend {
         self.provider = provider
         chat = WebChat(site: site)
         // An off-screen window keeps the page fully alive (laid out, timers running) without being visible.
-        hiddenWindow = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 900, height: 900),
+        // Desktop width, so the sites show their chat history sidebar.
+        hiddenWindow = NSWindow(contentRect: NSRect(x: -10000, y: -10000, width: 1280, height: 900),
                                 styleMask: [.borderless], backing: .buffered, defer: false)
         hiddenWindow.isReleasedWhenClosed = false
         hiddenWindow.ignoresMouseEvents = true
@@ -407,6 +418,51 @@ final class WebBackend {
 
     func release(_ id: UUID) { if owner == id { reset() } }
 
+    /// Recent conversations from the site's sidebar (newest first).
+    func listChats(_ done: @escaping ([ChatRef]) -> Void) {
+        chat.whenLoaded { [weak self] in
+            guard let self else { return }
+            self.chat.webView.callAsyncJavaScript(Self.listJS, arguments: ["pattern": self.chat.site.chatLink], in: nil, in: .page) { r in
+                let rows = (try? r.get()) as? [[String: Any]] ?? []
+                done(rows.compactMap { d in
+                    guard let t = d["title"] as? String, let u = d["url"] as? String else { return nil }
+                    return ChatRef(title: t, url: u)
+                })
+            }
+        }
+    }
+
+    /// The saved conversation currently on the page, if it's one (new chats get their URL after the first reply).
+    var currentChatURL: String? {
+        guard let u = chat.webView.url?.absoluteString,
+              u.range(of: chat.site.chatLink, options: .regularExpression) != nil else { return nil }
+        return u
+    }
+
+    /// Put popup `id`'s saved conversation on the page (loads in the background while you type).
+    func open(owner id: UUID, url: String) {
+        generation += 1
+        owner = id
+        fresh = false
+        needsSettle = true
+        chat.navigate(to: url)
+    }
+    private var needsSettle = false      // an existing conversation was just loaded; wait for it to render
+
+    private static let listJS = """
+    const re = new RegExp(pattern), out = [], seen = new Set();
+    for (const a of document.querySelectorAll('a[href]')) {
+      const h = a.getAttribute('href');
+      if (!re.test(h)) continue;
+      const url = new URL(h, location.href).href;
+      const title = (a.innerText || a.textContent || '').trim().split('\\n')[0].trim();
+      if (!title || seen.has(url)) continue;
+      seen.add(url);
+      out.push({title, url});
+    }
+    return out.slice(0, 40);
+    """
+
     /// Shows the real page (full conversation, images, model picker…) in a normal window.
     func showFull() {
         if fullWindow == nil {
@@ -426,8 +482,9 @@ final class WebBackend {
         fullWindow?.makeKeyAndOrderFront(nil)
     }
 
-    /// Sends one question. `image` is attached when non-nil. Streams the reply text via `onUpdate`.
-    func ask(owner id: UUID, text: String, image: Data?, onUpdate: @escaping (String) -> Void,
+    /// Sends one question with `images` attached. Streams the reply text via `onUpdate`.
+    /// `url`: this popup's saved conversation, reopened if another popup has used the page since.
+    func ask(owner id: UUID, url: String?, text: String, images: [Data], onUpdate: @escaping (String) -> Void,
              onDone: @escaping (String?) -> Void) {
         dlog("\(provider.rawValue) ask owner=\(owner?.uuidString.prefix(4) ?? "nil") me=\(id.uuidString.prefix(4)) fresh=\(fresh)")
         let go = { [weak self] in
@@ -435,10 +492,12 @@ final class WebBackend {
             dlog("\(self.provider.rawValue) page ready, sending")
             self.owner = id
             self.fresh = false
+            let settle = self.needsSettle
+            self.needsSettle = false
             let gen = self.generation
             self.chat.webView.callAsyncJavaScript(Self.askJS, arguments: [
                 "composer": self.chat.site.composer, "send": self.chat.site.send, "reply": self.chat.site.reply,
-                "b64": image?.base64EncodedString() ?? "", "text": text,
+                "imgs": images.map { $0.base64EncodedString() }, "text": text, "settle": settle,
             ], in: nil, in: .page) { r in
                 dlog("\(self.provider.rawValue) askJS => \(r) gen=\(gen)/\(self.generation)")
                 guard gen == self.generation else { return }
@@ -456,13 +515,12 @@ final class WebBackend {
                 self.poll(gen: gen, before: before, last: "", stable: 0, started: Date(), onUpdate: onUpdate, onDone: onDone)
             }
         }
-        if owner == id || fresh {
-            chatWhenLoaded(go)
-        } else {
-            // Another popup's conversation is on the page; start a new chat first.
-            reset()
-            chatWhenLoaded(go)
+        if owner != id, let url {
+            open(owner: id, url: url)        // our conversation was replaced by another popup's; bring it back
+        } else if owner != id && !fresh {
+            reset()                          // another popup's conversation is on the page; start a new chat
         }
+        chatWhenLoaded(go)
     }
 
     private func chatWhenLoaded(_ f: @escaping () -> Void) { chat.whenLoaded(f) }
@@ -494,14 +552,19 @@ final class WebBackend {
     let ed = null;
     for (let i = 0; i < 80 && !(ed = $(composer)); i++) await sleep(250);
     if (!ed) return {error: 'not-signed-in'};
+    if (settle) {   // a saved conversation is still rendering its messages; wait until the count stops changing
+      let n = -1, same = 0;
+      for (let i = 0; i < 40 && same < 4; i++) { const m = document.querySelectorAll(reply).length; same = (m === n && m > 0) ? same + 1 : 0; n = m; await sleep(250); }
+      ed = $(composer) || ed;
+    }
     const before = document.querySelectorAll(reply).length;
     // Clear any saved draft left in the box.
     ed.focus();
     { const s0 = window.getSelection(); s0.selectAllChildren(ed); document.execCommand('delete'); }
-    if (b64) {
+    for (const [n, b64] of imgs.entries()) {
       const bin = atob(b64), u8 = new Uint8Array(bin.length);
       for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-      const file = new File([u8], 'snapshot.png', {type: 'image/png', lastModified: Date.now()});
+      const file = new File([u8], n ? `snapshot-${n + 1}.png` : 'snapshot.png', {type: 'image/png', lastModified: Date.now()});
       const mk = () => { const dt = new DataTransfer(); dt.items.add(file); return dt; };
       const previews = () => document.querySelectorAll('img[src^="blob:"], img[src^="data:image"], form img').length;
       const base = previews();
@@ -634,27 +697,60 @@ struct WebViewHost: NSViewRepresentable {
 
 struct Msg: Identifiable {
     let id = UUID()
-    var role: String          // "You" or provider name
+    var role: String          // "You", a provider name, or "" for a note
     var text: String
     var isError = false
     var signIn: Provider?      // show a "Sign in to …" button under this (error) message
+    var images: [Attachment] = []
     var isUser: Bool { role == "You" }
+    var isNote: Bool { role.isEmpty }
+}
+
+/// An extra image added to a follow-up (pasted, dropped or snapped from the popup).
+struct Attachment: Identifiable {
+    let id = UUID()
+    let image: NSImage
+    let png: Data
+
+    init?(image: NSImage) {
+        guard let tiff = image.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return nil }
+        self.image = image
+        self.png = png
+    }
+
+    /// Images on the pasteboard: copied image data, or image files copied in Finder.
+    static func from(_ pb: NSPasteboard) -> [Attachment] {
+        let files = (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        let fromFiles = files.compactMap { NSImage(contentsOf: $0) }.compactMap { Attachment(image: $0) }
+        if !files.isEmpty { return fromFiles }
+        // Text wins over the image a rich-text copy also carries.
+        if pb.string(forType: .string) != nil { return [] }
+        return ((pb.readObjects(forClasses: [NSImage.self]) as? [NSImage]) ?? []).compactMap { Attachment(image: $0) }
+    }
 }
 
 final class ChatModel: ObservableObject {
     @Published var messages: [Msg] = []
     @Published var input = ""
     @Published var busy = false
+    @Published var pending: [Attachment] = []          // images for the next message
+    @Published var chats: [Provider: [ChatRef]] = [:]   // each site's recent conversations
+    @Published var loadingChats = false
+    @Published var focusRequest = 0                     // bump to put the cursor in the input box
     @Published var provider: Provider {
-        didSet { UserDefaults.standard.set(provider.rawValue, forKey: "provider") }
+        didSet { UserDefaults.standard.set(provider.rawValue, forKey: "provider"); loadChats() }
     }
     let id = UUID()
     private var webSynced: [Provider: Int] = [:]   // messages[0..<n] already on that site's page
+    private var chatURL: [Provider: String] = [:]  // this popup's conversation on each site
+    private var snapshotSent: Set<Provider> = []   // the snapshot is already in that conversation
+    private var claudeWeb = false                  // Claude via claude.ai for this popup (a claude.ai chat was resumed)
 
     let dir: URL
     let imageURL: URL
     let image: NSImage
-    private lazy var imageBase64: String = (try? Data(contentsOf: imageURL))?.base64EncodedString() ?? ""
+    private lazy var imageData: Data = (try? Data(contentsOf: imageURL)) ?? Data()
     private var claude: ClaudeSession?
     private var claudeSynced = 0            // messages[0..<claudeSynced] already known to the Claude session
 
@@ -665,19 +761,72 @@ final class ChatModel: ObservableObject {
         self.provider = Provider(rawValue: UserDefaults.standard.string(forKey: "provider") ?? "") ?? .claude
     }
 
+    /// Whether the current provider goes through its website for this popup.
+    func usesWeb(_ p: Provider) -> Bool { p.site != nil || (p == .claude && claudeWeb) }
+
     private func transcript(_ history: [Msg], then question: String) -> String {
-        let turns = history.filter { !$0.isError && !$0.text.isEmpty }
+        let turns = history.filter { !$0.isError && !$0.isNote && !$0.text.isEmpty }
         guard !turns.isEmpty else { return question }
         let past = turns.map { "\($0.isUser ? "User" : "Assistant"): \($0.text)" }.joined(separator: "\n\n")
         return "Earlier in this conversation about the screenshot:\n\n\(past)\n\nNew question: \(question)"
     }
 
+    func attach(_ items: [Attachment]) {
+        pending += items
+        focusRequest += 1
+    }
+
+    // MARK: Resuming a saved conversation
+
+    func loadChats() {
+        let p = provider
+        guard let backend = WebBackend.get(p) else { return }
+        loadingChats = true
+        backend.listChats { [weak self] list in
+            guard let self else { return }
+            if !list.isEmpty || self.chats[p] == nil { self.chats[p] = list }
+            if p == self.provider { self.loadingChats = false }
+        }
+    }
+
+    /// Continue `chat` instead of starting a new one: the next question (with the snapshot) goes there.
+    func resume(_ chat: ChatRef) {
+        let p = provider
+        guard !busy, let backend = WebBackend.get(p) else { return }
+        if p == .claude && p.site == nil { claudeWeb = true }
+        chatURL[p] = chat.url
+        webSynced[p] = 0              // anything already asked in this popup gets passed along as context
+        snapshotSent.remove(p)
+        backend.open(owner: id, url: chat.url)
+        messages.append(Msg(role: "", text: "Continuing “\(chat.title)” in \(p.rawValue)"))
+        focusRequest += 1
+    }
+
+    /// Back to a fresh conversation for this provider.
+    func newChat() {
+        let p = provider
+        guard !busy else { return }
+        if p == .claude { claudeWeb = false; claude?.stop(); claude = nil; claudeSynced = messages.count }
+        chatURL[p] = nil
+        webSynced[p] = messages.count   // a clean slate: don't replay this popup's earlier turns
+        snapshotSent.remove(p)
+        if let b = WebBackend.shared[p], b.owner == id { b.reset() }
+        messages.append(Msg(role: "", text: "New \(p.rawValue) chat"))
+        focusRequest += 1
+    }
+
+    // MARK: Asking
+
+    var canSend: Bool { !busy && !input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+
     func send() {
         let q = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty, !busy else { return }
         input = ""
+        let extra = pending
+        pending = []
         let prior = messages
-        messages.append(Msg(role: "You", text: q))
+        messages.append(Msg(role: "You", text: q, images: extra))
         messages.append(Msg(role: provider.rawValue, text: ""))
         let i = messages.count - 1
         busy = true
@@ -699,17 +848,19 @@ final class ChatModel: ObservableObject {
         }
 
         do {
-            switch provider {
-            case .claude where provider.site == nil: try askClaude(q, prior: prior, onDelta: onDelta, onDone: onDone)
-            case .claude
-            , .chatgpt, .gemini: askWeb(provider, q, prior: prior, onReplace: onReplace, onDone: onDone)
-            }
+            if usesWeb(provider) { askWeb(provider, q, prior: prior, extra: extra, onReplace: onReplace, onDone: onDone) }
+            else { try askClaude(q, prior: prior, extra: extra, onDelta: onDelta, onDone: onDone) }
         } catch {
             onDone(nil, error.localizedDescription)
         }
     }
 
-    private func askClaude(_ q: String, prior: [Msg], onDelta: @escaping (String) -> Void,
+    /// Images to attach: the snapshot (first time in a conversation), images from turns the AI hasn't seen, and new ones.
+    private func images(snapshot: Bool, missed: [Msg], extra: [Attachment]) -> [Data] {
+        (snapshot ? [imageData] : []) + missed.flatMap { $0.images.map(\.png) } + extra.map(\.png)
+    }
+
+    private func askClaude(_ q: String, prior: [Msg], extra: [Attachment], onDelta: @escaping (String) -> Void,
                            onDone: @escaping (String?, String?) -> Void) throws {
         let isNew = claude == nil
         if isNew {
@@ -718,27 +869,32 @@ final class ChatModel: ObservableObject {
                 if let self, self.claude === s { self.claude = nil; self.claudeSynced = 0 }
             }
             claude = s
-            claudeSynced = 0
         }
         // Replay only turns that happened with other providers since Claude last saw the chat.
         let missed = Array(prior[min(claudeSynced, prior.count)...])
-        claude?.send(text: transcript(missed, then: q), imageBase64: isNew ? imageBase64 : nil,
+        claude?.send(text: transcript(missed, then: q), images: images(snapshot: isNew, missed: missed, extra: extra),
                      onDelta: onDelta, onDone: onDone)
         claudeSynced = messages.count
     }
 
-    private func askWeb(_ p: Provider, _ q: String, prior: [Msg], onReplace: @escaping (String) -> Void,
-                        onDone: @escaping (String?, String?) -> Void) {
+    private func askWeb(_ p: Provider, _ q: String, prior: [Msg], extra: [Attachment],
+                        onReplace: @escaping (String) -> Void, onDone: @escaping (String?, String?) -> Void) {
         guard let backend = WebBackend.get(p) else { return }
-        // New conversation on the page if this popup doesn't own it (or it was reset): send image + context.
-        let isFirst = backend.owner != id
-        if isFirst { webSynced[p] = 0 }
+        // No conversation of ours on this site yet (or it was reset): start one, with the snapshot and context.
+        let isNew = chatURL[p] == nil && backend.owner != id
+        if isNew { webSynced[p] = 0; snapshotSent.remove(p) }
         let missed = Array(prior[min(webSynced[p] ?? 0, prior.count)...])
         var text = transcript(missed, then: q)
-        if isFirst { text = systemPrompt + "\n\n" + text }
-        backend.ask(owner: id, text: text, image: isFirst ? (try? Data(contentsOf: imageURL)) : nil,
-                    onUpdate: onReplace) { [weak self] err in
-            if err == nil, let self { self.webSynced[p] = self.messages.count }
+        if isNew { text = systemPrompt + "\n\n" + text }
+        let imgs = images(snapshot: !snapshotSent.contains(p), missed: missed, extra: extra)
+        backend.ask(owner: id, url: chatURL[p], text: text, images: imgs, onUpdate: onReplace) { [weak self] err in
+            guard let self else { return onDone(nil, err) }
+            if err == nil {
+                self.webSynced[p] = self.messages.count
+                self.snapshotSent.insert(p)
+                if let u = backend.currentChatURL { self.chatURL[p] = u }
+                if self.chats[p]?.contains(where: { $0.url == self.chatURL[p] }) != true { self.loadChats() }
+            }
             onDone(nil, err)
         }
     }
@@ -769,36 +925,88 @@ func renderMarkdown(_ s: String) -> AttributedString {
         ?? AttributedString(s)
 }
 
+struct Thumb: View {
+    let image: NSImage
+    var height: CGFloat = 44
+    var body: some View {
+        Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
+            .frame(maxWidth: height * 2.2, maxHeight: height)
+            .clipShape(RoundedRectangle(cornerRadius: 5))
+            .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.primary.opacity(0.15)))
+    }
+}
+
 struct MessageRow: View {
     let msg: Msg
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(msg.role).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-            if msg.text.isEmpty {
-                HStack(spacing: 6) {
-                    ProgressView().controlSize(.mini)
-                    Text("Thinking…").foregroundStyle(.secondary)
+        if msg.isNote {
+            HStack(spacing: 6) {
+                Image(systemName: "arrow.uturn.forward").font(.caption2)
+                Text(msg.text).font(.caption)
+            }
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .center)
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(msg.role).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                if !msg.images.isEmpty {
+                    HStack(spacing: 6) { ForEach(msg.images) { Thumb(image: $0.image) } }
                 }
-            } else {
-                Text(renderMarkdown(msg.text))
-                    .foregroundStyle(msg.isError ? Color.red : Color.primary)
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let p = msg.signIn {
-                    Button("Sign in to \(p.rawValue)…") { AppDelegate.shared.signIn(to: p) }
-                        .padding(.top, 4)
+                if msg.text.isEmpty {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.mini)
+                        Text("Thinking…").foregroundStyle(.secondary)
+                    }
+                } else {
+                    Text(renderMarkdown(msg.text))
+                        .foregroundStyle(msg.isError ? Color.red : Color.primary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let p = msg.signIn {
+                        Button("Sign in to \(p.rawValue)…") { AppDelegate.shared.signIn(to: p) }
+                            .padding(.top, 4)
+                    }
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(msg.isUser ? 0 : 10)
+            .background(msg.isUser ? Color.clear : Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(msg.isUser ? 0 : 10)
-        .background(msg.isUser ? Color.clear : Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// "Chats ▾": start fresh, or pick up one of the site's saved conversations.
+struct ChatsMenu: View {
+    @ObservedObject var model: ChatModel
+    var body: some View {
+        let list = model.chats[model.provider] ?? []
+        Menu {
+            Button("New chat") { model.newChat() }
+            Divider()
+            if list.isEmpty {
+                Text(model.loadingChats ? "Loading…" : "No saved chats found")
+            } else {
+                Section("Continue a \(model.provider.rawValue) chat") {
+                    ForEach(list) { c in Button(c.title) { model.resume(c) } }
+                }
+            }
+            Divider()
+            Button("Refresh list") { model.loadChats() }
+        } label: {
+            Text("Chats")
+        }
+        .menuStyle(.borderlessButton)
+        .controlSize(.small)
+        .fixedSize()
+        .disabled(model.busy)
+        .help("Start a new chat or continue a saved one")
     }
 }
 
 struct ChatView: View {
     @ObservedObject var model: ChatModel
     var onClose: () -> Void
+    var onSnap: () -> Void
     @FocusState private var focused: Bool
     @State private var contentHeight: CGFloat = 0
 
@@ -823,11 +1031,12 @@ struct ChatView: View {
                             .buttonStyle(.plain).help("Close (Esc)")
                     }
                     HStack(spacing: 10) {
-                        if model.provider.site != nil {
+                        ChatsMenu(model: model)
+                        if model.usesWeb(model.provider) {
                             Button("Open full chat ↗") { WebBackend.get(model.provider)?.showFull() }
                                 .buttonStyle(.link).font(.caption2)
                         }
-                        Text("⌘1 / ⌘2 / ⌘3 to switch").font(.caption2).foregroundStyle(.tertiary)
+                        Text("⌘1/2/3").font(.caption2).foregroundStyle(.tertiary).help("⌘1 / ⌘2 / ⌘3 switch between Claude, ChatGPT and Gemini")
                     }
                 }
             }
@@ -844,18 +1053,39 @@ struct ChatView: View {
                         .padding(12)
                         .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { contentHeight = $0 }
                     }
-                    .frame(height: min(max(contentHeight, 60), 460))
+                    .frame(height: min(max(contentHeight, 40), 460))
                     .onChange(of: model.messages.last?.text) { proxy.scrollTo("bottom", anchor: .bottom) }
+                    .onChange(of: model.messages.count) { proxy.scrollTo("bottom", anchor: .bottom) }
                 }
             }
 
             Divider()
+            if !model.pending.isEmpty {
+                HStack(spacing: 8) {
+                    ForEach(model.pending) { a in
+                        Thumb(image: a.image)
+                            .overlay(alignment: .topTrailing) {
+                                Button { model.pending.removeAll { $0.id == a.id } } label: {
+                                    Image(systemName: "xmark.circle.fill").foregroundStyle(.white, .black.opacity(0.6))
+                                }
+                                .buttonStyle(.plain).offset(x: 5, y: -5).help("Remove")
+                            }
+                    }
+                    Spacer()
+                }
+                .padding([.horizontal, .top], 12)
+            }
             HStack(spacing: 8) {
-                TextField(model.messages.isEmpty ? "Ask about this snapshot…" : "Follow-up…", text: $model.input, axis: .vertical)
+                TextField(model.messages.isEmpty ? "Ask about this snapshot…" : "Follow-up…  (⌘V pastes an image)",
+                          text: $model.input, axis: .vertical)
                     .textFieldStyle(.plain).font(.system(size: 14))
                     .lineLimit(1...6)
                     .focused($focused)
                     .onSubmit { model.send() }
+                Button(action: onSnap) { Image(systemName: "camera.viewfinder").font(.system(size: 15)) }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+                    .help("Snap another area of the screen and attach it")
+                    .disabled(model.busy)
                 if model.busy {
                     ProgressView().controlSize(.small)
                 } else {
@@ -863,7 +1093,7 @@ struct ChatView: View {
                         Image(systemName: "arrow.up.circle.fill").font(.system(size: 20))
                     }
                     .buttonStyle(.plain)
-                    .disabled(model.input.trimmingCharacters(in: .whitespaces).isEmpty)
+                    .disabled(!model.canSend)
                 }
             }
             .padding(12)
@@ -879,35 +1109,53 @@ struct ChatView: View {
                 }
             }.opacity(0)
         )
-        .onAppear { DispatchQueue.main.async { focused = true } }
+        .onDrop(of: [.image, .fileURL], isTargeted: nil) { providers in
+            for item in providers {
+                _ = item.loadObject(ofClass: NSImage.self) { obj, _ in
+                    if let img = obj as? NSImage, let a = Attachment(image: img) {
+                        DispatchQueue.main.async { model.attach([a]) }
+                    }
+                }
+            }
+            return true
+        }
+        .onAppear {
+            DispatchQueue.main.async { focused = true }
+            model.loadChats()
+        }
         .onChange(of: model.busy) { if !model.busy { focused = true } }
+        .onChange(of: model.focusRequest) { focused = true }
     }
 }
 
 // MARK: - Popup panel
 
-final class AskPanel: NSPanel, NSWindowDelegate {
+/// The popup: an ordinary window (other windows can cover it; ⌘Tab / the recall shortcut bring it back).
+final class AskPanel: NSWindow, NSWindowDelegate {
     let model: ChatModel
     private var topLeft: NSPoint = .zero
 
     init(model: ChatModel, near point: NSPoint) {
         self.model = model
         super.init(contentRect: NSRect(x: 0, y: 0, width: 520, height: 140),
-                   styleMask: [.titled, .closable, .resizable, .fullSizeContentView, .nonactivatingPanel],
+                   styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                    backing: .buffered, defer: false)
+        title = "SnapAsk"
         titleVisibility = .hidden
         titlebarAppearsTransparent = true
         standardWindowButton(.closeButton)?.isHidden = true
         standardWindowButton(.miniaturizeButton)?.isHidden = true
         standardWindowButton(.zoomButton)?.isHidden = true
         isMovableByWindowBackground = true
-        level = .floating
-        hidesOnDeactivate = false
         isReleasedWhenClosed = false
-        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        // Follow you to the current Space when brought back, and work over full-screen apps.
+        collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         delegate = self
 
-        let host = NSHostingController(rootView: ChatView(model: model, onClose: { [weak self] in self?.close() }))
+        let host = NSHostingController(rootView: ChatView(
+            model: model,
+            onClose: { [weak self] in self?.close() },
+            onSnap: { [weak self] in self?.snapAttachment() }))
         host.sizingOptions = [.preferredContentSize]
         contentViewController = host
 
@@ -924,6 +1172,26 @@ final class AskPanel: NSPanel, NSWindowDelegate {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
     override func cancelOperation(_ sender: Any?) { close() }
+
+    /// ⌘V with an image (or image file) on the clipboard attaches it to the next message; text pastes as usual.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           event.charactersIgnoringModifiers == "v" {
+            let found = Attachment.from(.general)
+            if !found.isEmpty { model.attach(found); return true }
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
+    /// Camera button: drag over another part of the screen and attach it to the next message.
+    func snapAttachment() {
+        let file = model.dir.appendingPathComponent("extra-\(UUID().uuidString.prefix(8)).png")
+        AppDelegate.shared.capture(to: file) { [weak self] ok in
+            guard let self else { return }
+            if ok, let img = NSImage(contentsOf: file), let a = Attachment(image: img) { self.model.attach([a]) }
+            AppDelegate.shared.bringBack(self)
+        }
+    }
 
     // Grow downward as the conversation gets longer; flip upward if we'd run off the screen.
     // Moving the window while AppKit is mid-layout (this callback can fire inside a layout pass) makes it
@@ -947,9 +1215,15 @@ final class AskPanel: NSPanel, NSWindowDelegate {
     func windowDidMove(_ notification: Notification) {
         topLeft = NSPoint(x: frame.minX, y: frame.maxY)
     }
+    func windowDidBecomeKey(_ notification: Notification) {
+        // Most recently used popup last: that's the one the recall shortcut brings back.
+        AppDelegate.shared.panels.removeAll { $0 === self }
+        AppDelegate.shared.panels.append(self)
+    }
     func windowWillClose(_ notification: Notification) {
         model.shutdown()
         AppDelegate.shared.panels.removeAll { $0 === self }
+        AppDelegate.shared.updateActivationPolicy()
     }
 }
 
@@ -969,13 +1243,28 @@ struct HotKeyChoice {
     static var current: HotKeyChoice {
         all.first { $0.label == UserDefaults.standard.string(forKey: "hotkey") } ?? all[0]
     }
+
+    /// Shortcut that brings the last popup back in front of your work (press again to send it back).
+    static let recallAll: [HotKeyChoice] = [
+        .init(label: "fn⌃A", keyCode: kVK_ANSI_A, mods: 0, isFn: true),
+        .init(label: "fn⌃R", keyCode: kVK_ANSI_R, mods: 0, isFn: true),
+        .init(label: "⌘⇧1", keyCode: kVK_ANSI_1, mods: cmdKey | shiftKey),
+        .init(label: "⌃⇧A", keyCode: kVK_ANSI_A, mods: controlKey | shiftKey),
+        .init(label: "⌃⌥⌘A", keyCode: kVK_ANSI_A, mods: controlKey | optionKey | cmdKey),
+        .init(label: "Off", keyCode: -1, mods: 0),
+    ]
+    static var recall: HotKeyChoice {
+        recallAll.first { $0.label == UserDefaults.standard.string(forKey: "hotkey.recall") } ?? recallAll[0]
+    }
+    var isOff: Bool { keyCode < 0 }
 }
 
-/// fn+⌃S via a CGEvent tap (needs Accessibility permission). The keystroke is swallowed so ⌃S doesn't reach the app.
+/// fn+⌃<key> shortcuts via a CGEvent tap (needs Accessibility permission). The keystroke is swallowed so it doesn't reach the app.
 enum FnHotKey {
     static var tap: CFMachPort?
     static var source: CFRunLoopSource?
     static var retry: Timer?
+    static var actions: [Int64: () -> Void] = [:]   // key code → action, for the fn shortcuts in use
 
     static func start() {
         stop()
@@ -996,12 +1285,12 @@ enum FnHotKey {
             if event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_ANSI_S), !f.intersection([.maskControl, .maskSecondaryFn, .maskCommand, .maskAlternate]).isEmpty {
                 dlog("S keyDown flags=0x\(String(f.rawValue, radix: 16))")
             }
-            if event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_ANSI_S),
+            if let action = FnHotKey.actions[event.getIntegerValueField(.keyboardEventKeycode)],
                f.contains(.maskSecondaryFn), f.contains(.maskControl),
                !f.contains(.maskCommand), !f.contains(.maskAlternate), !f.contains(.maskShift) {
                 if event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
-                    dlog("fn⌃S pressed")
-                    DispatchQueue.main.async { AppDelegate.shared.snap() }
+                    dlog("fn⌃ shortcut pressed: key \(event.getIntegerValueField(.keyboardEventKeycode))")
+                    DispatchQueue.main.async(execute: action)
                 }
                 return nil
             }
@@ -1030,6 +1319,7 @@ enum FnHotKey {
 
 struct WelcomeView: View {
     @State private var hotkey = HotKeyChoice.current.label
+    @State private var recallKey = HotKeyChoice.recall.label
     @State private var screenOK = CGPreflightScreenCaptureAccess()
     @State private var axOK = AXIsProcessTrusted()
     @State private var claudeRoute = ClaudeRoute.setting
@@ -1081,6 +1371,19 @@ struct WelcomeView: View {
                 }
             }
             HStack {
+                Text("Bring back popup:")
+                Picker("", selection: $recallKey) {
+                    ForEach(HotKeyChoice.recallAll, id: \.label) { Text($0.label).tag($0.label) }
+                }
+                .labelsHidden().frame(width: 130)
+                .onChange(of: recallKey) {
+                    UserDefaults.standard.set(recallKey, forKey: "hotkey.recall")
+                    AppDelegate.shared.registerHotKey()
+                }
+            }
+            Text("After asking, let the popup sit behind your work; this shortcut brings it back to the same chat. Press it again to send it back.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack {
                 Image(systemName: screenOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                     .foregroundStyle(screenOK ? .green : .orange)
                 Text(screenOK ? "Screen Recording permission granted" : "Screen Recording permission needed")
@@ -1089,7 +1392,7 @@ struct WelcomeView: View {
                     Button("Grant…") { AppDelegate.shared.requestScreenAccess() }
                 }
             }
-            if HotKeyChoice.current.isFn || hotkey.hasPrefix("fn") {
+            if hotkey.hasPrefix("fn") || recallKey.hasPrefix("fn") {
                 HStack {
                     Image(systemName: axOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                         .foregroundStyle(axOK ? .green : .orange)
@@ -1149,7 +1452,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     static let shared = AppDelegate()
     var statusItem: NSStatusItem!
     var panels: [AskPanel] = []
-    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyRefs: [EventHotKeyRef] = []
     private var capturing = false
     let cacheRoot = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("SnapAsk", isDirectory: true)
@@ -1158,6 +1461,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         try? FileManager.default.removeItem(at: cacheRoot)   // clear leftovers from a previous run
         dlog("launched")
         setupStatusItem()
+        installMainMenu()
         registerHotKey()
         ClaudeRoute.detect { WebBackend.prewarmAll() }
         // Test hook: `osascript -e 'tell application "SnapAsk" to activate'` won't work for accessory apps, so listen here.
@@ -1211,6 +1515,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let snap = NSMenuItem(title: "Snap & Ask   \(HotKeyChoice.current.label)", action: #selector(snapFromMenu), keyEquivalent: "")
         snap.target = self
         menu.addItem(snap)
+        let back = NSMenuItem(title: "Bring Back Popup   \(HotKeyChoice.recall.isOff ? "" : HotKeyChoice.recall.label)",
+                              action: #selector(recallFromMenu), keyEquivalent: "")
+        back.target = self
+        menu.addItem(back)
         let settings = NSMenuItem(title: "Setup & Accounts…", action: #selector(showWelcomeFromMenu), keyEquivalent: "")
         settings.target = self
         menu.addItem(settings)
@@ -1310,56 +1618,152 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func snapFromMenu() { snap() }
+    @objc private func recallFromMenu() { recall() }
     @objc private func showWelcomeFromMenu() { showWelcome() }
 
     private var handlerInstalled = false
 
+    /// Registers the snap shortcut (id 1) and the bring-back shortcut (id 2).
     func registerHotKey() {
         if !handlerInstalled {
             var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-            InstallEventHandler(GetEventDispatcherTarget(), { _, _, _ in
-                dlog("hotkey pressed")
-                DispatchQueue.main.async { AppDelegate.shared.snap() }
+            InstallEventHandler(GetEventDispatcherTarget(), { _, event, _ in
+                var hk = EventHotKeyID()
+                GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                  nil, MemoryLayout<EventHotKeyID>.size, nil, &hk)
+                dlog("hotkey pressed id=\(hk.id)")
+                DispatchQueue.main.async { hk.id == 2 ? AppDelegate.shared.recall() : AppDelegate.shared.snap() }
                 return noErr
             }, 1, &spec, nil, nil)
             handlerInstalled = true
         }
-        if let ref = hotKeyRef { UnregisterEventHotKey(ref); hotKeyRef = nil }
-        let hk = HotKeyChoice.current
-        if hk.isFn {
-            FnHotKey.start()
-            if statusItem != nil { rebuildMenu() }
-            return
+        hotKeyRefs.forEach { UnregisterEventHotKey($0) }
+        hotKeyRefs = []
+        FnHotKey.actions = [:]
+        for (n, hk) in [(UInt32(1), HotKeyChoice.current), (2, HotKeyChoice.recall)] where !hk.isOff {
+            if hk.isFn {
+                FnHotKey.actions[Int64(hk.keyCode)] = n == 1 ? { AppDelegate.shared.snap() } : { AppDelegate.shared.recall() }
+                continue
+            }
+            var ref: EventHotKeyRef?
+            let status = RegisterEventHotKey(UInt32(hk.keyCode), UInt32(hk.mods), EventHotKeyID(signature: OSType(0x534E_4150), id: n),
+                                             GetEventDispatcherTarget(), 0, &ref)   // 'SNAP'
+            dlog("RegisterEventHotKey \(hk.label) status=\(status)")
+            if let ref { hotKeyRefs.append(ref) }
         }
-        FnHotKey.stop()
-        let id = EventHotKeyID(signature: OSType(0x534E_4150), id: 1)   // 'SNAP'
-        let status = RegisterEventHotKey(UInt32(hk.keyCode), UInt32(hk.mods), id,
-                                         GetEventDispatcherTarget(), 0, &hotKeyRef)
-        dlog("RegisterEventHotKey \(hk.label) status=\(status)")
+        if FnHotKey.actions.isEmpty { FnHotKey.stop() } else if FnHotKey.tap == nil { FnHotKey.start() }
         if statusItem != nil { rebuildMenu() }
     }
 
     func snap() {
         dlog("snap() capturing=\(capturing)")
         guard !capturing else { return }
-        capturing = true
         let dir = cacheRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let shot = dir.appendingPathComponent("snapshot.png")
+        capture(to: shot) { ok in
+            if ok { self.showPanel(dir: dir, shot: shot) } else { try? FileManager.default.removeItem(at: dir) }
+        }
+    }
 
+    /// Interactive region capture (Space = window) into `file`; `done(false)` if cancelled.
+    func capture(to file: URL, done: @escaping (Bool) -> Void) {
+        guard !capturing else { return }
+        capturing = true
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        p.arguments = ["-i", "-x", "-o", shot.path]   // interactive region (Space = window), no sound, no shadow
+        p.arguments = ["-i", "-x", "-o", file.path]   // interactive, no sound, no shadow
         p.terminationHandler = { proc in
             dlog("screencapture exited status=\(proc.terminationStatus)")
             DispatchQueue.main.async {
                 self.capturing = false
-                let size = (try? FileManager.default.attributesOfItem(atPath: shot.path)[.size] as? Int) ?? 0
-                guard size > 0 else { try? FileManager.default.removeItem(at: dir); return }   // cancelled
-                self.showPanel(dir: dir, shot: shot)
+                let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size] as? Int) ?? 0
+                done(size > 0)
             }
         }
-        do { try p.run() } catch { dlog("screencapture failed: \(error)"); capturing = false }
+        do { try p.run() } catch { dlog("screencapture failed: \(error)"); capturing = false; done(false) }
+    }
+
+    /// Bring-back shortcut: the most recent popup comes to the front, ready to type.
+    /// Pressed while it's already in front, it goes back behind your work.
+    func recall() {
+        guard let panel = panels.last else {
+            dlog("recall: no popup open")
+            return NSSound.beep()
+        }
+        if NSApp.isActive && panel.isKeyWindow && !panel.isMiniaturized { NSApp.hide(nil); return }
+        bringBack(panel)
+    }
+
+    func bringBack(_ panel: AskPanel) {
+        if NSApp.isHidden { NSApp.unhide(nil) }
+        if panel.isMiniaturized { panel.deminiaturize(nil) }
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        panel.model.focusRequest += 1
+    }
+
+    /// While a popup is open SnapAsk acts like a normal app (Dock icon, ⌘Tab); otherwise it lives only in the menu bar.
+    func updateActivationPolicy() {
+        let want: NSApplication.ActivationPolicy = panels.isEmpty ? .accessory : .regular
+        guard NSApp.activationPolicy() != want else { return }
+        NSApp.setActivationPolicy(want)
+        if want == .regular { NSApp.applicationIconImage = Self.appIcon }
+    }
+
+    static let appIcon: NSImage = {
+        let size = NSSize(width: 512, height: 512)
+        return NSImage(size: size, flipped: false) { r in
+            let bg = NSBezierPath(roundedRect: r.insetBy(dx: 50, dy: 50), xRadius: 90, yRadius: 90)
+            NSGradient(starting: NSColor(calibratedRed: 0.25, green: 0.52, blue: 0.98, alpha: 1),
+                       ending: NSColor(calibratedRed: 0.42, green: 0.30, blue: 0.92, alpha: 1))?.draw(in: bg, angle: -90)
+            let cfg = NSImage.SymbolConfiguration(pointSize: 230, weight: .medium)
+                .applying(.init(paletteColors: [.white]))
+            if let sym = NSImage(systemSymbolName: "text.viewfinder", accessibilityDescription: nil)?.withSymbolConfiguration(cfg) {
+                let s = sym.size
+                sym.draw(in: NSRect(x: (r.width - s.width) / 2, y: (r.height - s.height) / 2, width: s.width, height: s.height))
+            }
+            return true
+        }
+    }()
+
+    /// App / Edit / Window menus: shown while a popup is open, and what makes ⌘C ⌘V ⌘A ⌘Z ⌘W ⌘M work.
+    func installMainMenu() {
+        let main = NSMenu()
+        func sub(_ title: String, _ items: [NSMenuItem]) {
+            let top = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            let m = NSMenu(title: title)
+            items.forEach(m.addItem)
+            top.submenu = m
+            main.addItem(top)
+        }
+        func item(_ t: String, _ a: Selector?, _ k: String, _ mods: NSEvent.ModifierFlags = .command, target: AnyObject? = nil) -> NSMenuItem {
+            let i = NSMenuItem(title: t, action: a, keyEquivalent: k)
+            i.keyEquivalentModifierMask = mods
+            i.target = target
+            return i
+        }
+        sub("SnapAsk", [
+            item("Snap & Ask", #selector(snapFromMenu), "", target: self),
+            item("Setup & Accounts…", #selector(showWelcomeFromMenu), ",", target: self),
+            .separator(),
+            item("Hide SnapAsk", #selector(NSApplication.hide(_:)), "h"),
+            item("Quit SnapAsk", #selector(NSApplication.terminate(_:)), "q"),
+        ])
+        sub("Edit", [
+            item("Undo", Selector(("undo:")), "z"),
+            item("Redo", Selector(("redo:")), "z", [.command, .shift]),
+            .separator(),
+            item("Cut", #selector(NSText.cut(_:)), "x"),
+            item("Copy", #selector(NSText.copy(_:)), "c"),
+            item("Paste", #selector(NSText.paste(_:)), "v"),
+            item("Select All", #selector(NSText.selectAll(_:)), "a"),
+        ])
+        sub("Window", [
+            item("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"),
+            item("Close", #selector(NSWindow.performClose(_:)), "w"),
+        ])
+        NSApp.mainMenu = main
     }
 
     // Developer hooks (distributed notifications) for testing without a human at the keyboard.
@@ -1406,6 +1810,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             for m in panel.model.messages { dlog("[\(m.role)] \(m.text)") }
         }
         dnc.addObserver(forName: .init("com.snapask.debug.welcome"), object: nil, queue: .main) { _ in self.showWelcome() }
+        dnc.addObserver(forName: .init("com.snapask.debug.recall"), object: nil, queue: .main) { _ in self.recall() }
+        dnc.addObserver(forName: .init("com.snapask.debug.front"), object: nil, queue: .main) { n in
+            // "N": bring the popup opened Nth (0 = oldest) to the front; "state": log window/app state
+            let byAge = self.panels.sorted { $0.windowNumber < $1.windowNumber }
+            if let i = (n.object as? String).flatMap(Int.init), i < byAge.count { self.bringBack(byAge[i]) }
+            dlog("state: active=\(NSApp.isActive) hidden=\(NSApp.isHidden) policy=\(NSApp.activationPolicy().rawValue) " +
+                 byAge.map { "[#\($0.windowNumber) key=\($0.isKeyWindow) visible=\($0.isVisible) level=\($0.level.rawValue)]" }.joined())
+        }
+        dnc.addObserver(forName: .init("com.snapask.debug.attach"), object: nil, queue: .main) { n in
+            guard let path = n.object as? String, let panel = self.panels.last,
+                  let img = NSImage(contentsOfFile: path), let a = Attachment(image: img) else { return }
+            panel.model.attach([a])
+        }
+        dnc.addObserver(forName: .init("com.snapask.debug.chats"), object: nil, queue: .main) { n in
+            guard let panel = self.panels.last else { return }
+            let list = panel.model.chats[panel.model.provider] ?? []
+            dlog("chats[\(panel.model.provider.rawValue)] = \(list.prefix(8).map { "\($0.title) <\($0.url)>" })")
+            if let i = (n.object as? String).flatMap(Int.init), i < list.count { panel.model.resume(list[i]) }
+        }
         dnc.addObserver(forName: .init("com.snapask.debug.closeall"), object: nil, queue: .main) { _ in
             self.panels.forEach { $0.close() }
             self.welcome?.close()
@@ -1415,6 +1838,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showPanel(dir: URL, shot: URL, at anchor: NSPoint? = nil) {
         let panel = AskPanel(model: ChatModel(dir: dir, imageURL: shot), near: anchor ?? NSEvent.mouseLocation)
         panels.append(panel)
+        updateActivationPolicy()
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
     }

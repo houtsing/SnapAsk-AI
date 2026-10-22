@@ -117,13 +117,13 @@ public static class ClaudeCli
 
         private string Tail() { lock (stderr) { var s = stderr.ToString().Trim(); return s.Length > 400 ? s[^400..] : s; } }
 
-        public Task<string?> AskAsync(string text, byte[]? png, Action<string> delta)
+        public Task<string?> AskAsync(string text, System.Collections.Generic.IEnumerable<byte[]> images, Action<string> delta)
         {
             onDelta = delta;
             sawDelta = false;
             turn = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
             var content = new System.Collections.Generic.List<object>();
-            if (png != null)
+            foreach (var png in images)
                 content.Add(new { type = "image", source = new { type = "base64", media_type = "image/png", data = Convert.ToBase64String(png) } });
             content.Add(new { type = "text", text });
             var msg = new { type = "user", message = new { role = "user", content } };

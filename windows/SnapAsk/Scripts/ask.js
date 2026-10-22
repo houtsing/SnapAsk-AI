@@ -1,19 +1,24 @@
-// Args: composer, send, reply (CSS selectors), b64 (PNG or ""), text.
-// Waits for the composer, clears any draft, attaches the image, types, presses send.
+// Args: composer, send, reply (CSS selectors), imgs (base64 PNGs), text, settle (a saved chat was just opened).
+// Waits for the composer, clears any draft, attaches the images, types, presses send.
 // Returns {before} (reply count before sending) or {error}.
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const $ = s => document.querySelector(s);
 let ed = null;
 for (let i = 0; i < 80 && !(ed = $(composer)); i++) await sleep(250);
 if (!ed) return {error: 'not-signed-in'};
+if (settle) {   // a saved conversation is still rendering its messages; wait until the count stops changing
+  let n = -1, same = 0;
+  for (let i = 0; i < 40 && same < 4; i++) { const m = document.querySelectorAll(reply).length; same = (m === n && m > 0) ? same + 1 : 0; n = m; await sleep(250); }
+  ed = $(composer) || ed;
+}
 const before = document.querySelectorAll(reply).length;
 // Clear any saved draft left in the box.
 ed.focus();
 { const s0 = window.getSelection(); s0.selectAllChildren(ed); document.execCommand('delete'); }
-if (b64) {
+for (const [n, b64] of imgs.entries()) {
   const bin = atob(b64), u8 = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-  const file = new File([u8], 'snapshot.png', {type: 'image/png', lastModified: Date.now()});
+  const file = new File([u8], n ? `snapshot-${n + 1}.png` : 'snapshot.png', {type: 'image/png', lastModified: Date.now()});
   const mk = () => { const dt = new DataTransfer(); dt.items.add(file); return dt; };
   const previews = () => document.querySelectorAll('img[src^="blob:"], img[src^="data:image"], form img').length;
   const base = previews();
